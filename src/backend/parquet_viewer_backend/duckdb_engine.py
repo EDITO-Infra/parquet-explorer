@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import base64
 import duckdb
 
 from parquet_viewer_backend.config import settings
@@ -14,7 +14,7 @@ class DuckDbQueryEngine(QueryEngine):
         con.execute("SET enable_progress_bar=false")
         con.execute(f"SET memory_limit='{settings.duckdb_memory_limit}'")
         con.execute(f"SET threads={settings.duckdb_threads}")
-        con.execute(f"SET statement_timeout='{settings.query_timeout_s}s'")
+        # con.execute(f"SET statement_timeout='{settings.query_timeout_s}s'")
         try:
             con.execute("INSTALL httpfs")
         except Exception:
@@ -44,6 +44,10 @@ class DuckDbQueryEngine(QueryEngine):
         request = QueryRequest(sql="SELECT * FROM __dataset", limit=limit, offset=0)
         return self.query(ref, request)
 
+    def _safe_value(self, v):
+        if isinstance(v, (bytes, bytearray)):
+            return base64.b64encode(v).decode("ascii")
+        return v
     def query(self, ref: DatasetRef, request: QueryRequest) -> QueryResponse:
         sql = validate_read_only_sql(request.sql)
         capped_limit = min(request.limit, settings.max_rows)
@@ -64,7 +68,7 @@ class DuckDbQueryEngine(QueryEngine):
 
             return QueryResponse(
                 columns=columns,
-                rows=[list(r) for r in records],
+                rows=[[self._safe_value(v) for v in r] for r in records],
                 row_count=len(records),
                 truncated=truncated,
             )

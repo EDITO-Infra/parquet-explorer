@@ -34,7 +34,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/tiles/{z}/{x}/{y}.mvt", get(get_tile));
+        .route("/tiles/{z}/{x}/{y}", get(get_tile));
 
     let bind = env::var("TILE_BIND").unwrap_or_else(|_| "0.0.0.0:8090".to_string());
     let addr: SocketAddr = bind.parse().expect("TILE_BIND must be a valid socket address");

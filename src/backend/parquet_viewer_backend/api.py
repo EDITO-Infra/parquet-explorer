@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query, Response
-
+import logging
 from parquet_viewer_backend.config import settings
 from parquet_viewer_backend.deps import catalog, query_engine, tile_provider
 from parquet_viewer_backend.models import (
@@ -83,22 +83,41 @@ def run_query(dataset: str = Query(..., min_length=1), request: QueryRequest | N
 @router.get("/api/geo/eligible")
 def is_geo_eligible(
     dataset: str = Query(..., min_length=1),
-    geom_column: str = Query(default="geom", min_length=1),
-) -> dict[str, bool | str]:
+    geom_column: str | None = Query(default=None),
+):
     try:
         schema = get_schema(dataset)
     except HTTPException:
         raise
+    logging.debug("Checking geo eligibility for dataset %s with schema: %s", dataset, schema)
+    # Auto-detect BLOB column if none specified
+    if geom_column is None:
+        blob_cols = [
+            c for c in schema.columns
+            if c.type.upper() in {"BLOB", "BYTEA", "VARBINARY"}
+        ]
+        if not blob_cols:
+            logging.debug("No binary columns found in dataset %s schema, not eligible for geo features", dataset)
+            return {"eligible": False, "reason": "No binary geometry column found"}
+        geom_column = blob_cols[0].name
 
     column = next((c for c in schema.columns if c.name == geom_column), None)
     if column is None:
+        logging.debug("Specified geometry column %s not found in dataset %s schema", geom_column, dataset)
         return {"eligible": False, "reason": f"Missing column: {geom_column}"}
 
-    eligible = column.type.upper() in {"BLOB", "BYTEA", "VARBINARY"}
-    if not eligible:
-        return {"eligible": False, "reason": f"Column {geom_column} is not binary WKB"}
-
-    return {"eligible": True, "reason": "WKB geometry column found"}
+    if column.type.upper() not in {"BLOB", "BYTEA", "VARBINARY"}:
+        logging.debug("Specified geometry column %s in dataset %s is not binary type (found type %s)", geom_column, dataset, column.type)
+        return {
+            "eligible": False,
+            "reason": f"Column {geom_column} is not binary WKB (type={column.type})",
+        }
+    logging.info("Dataset %s is eligible for geo features with geometry column %s", dataset, geom_column)
+    return {
+        "eligible": True,
+        "reason": f"WKB geometry column found: {geom_column}",
+        "geom_column": geom_column,
+    }
 
 
 @router.get("/tiles/{z}/{x}/{y}.mvt")

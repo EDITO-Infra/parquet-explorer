@@ -54,7 +54,7 @@ function MapPanel({ dataset, geomColumn }: { dataset: string; geomColumn: string
       map.addSource(sourceId, {
         type: 'vector',
         tiles: [
-          `/tiles/{z}/{x}/{y}.mvt?dataset=${encodeURIComponent(dataset)}&geom_column=${encodeURIComponent(geomColumn)}`
+          `${API_BASE}/tiles/{z}/{x}/{y}.mvt?dataset=${encodeURIComponent(dataset)}&geom_column=${encodeURIComponent(geomColumn)}`
         ],
         minzoom: 0,
         maxzoom: 14
@@ -115,20 +115,32 @@ export default function App() {
     ;(async () => {
       try {
         setError('')
-        const [nextSchema, preview, geo] = await Promise.all([
+        const [nextSchema, preview] = await Promise.all([
           getSchema(dataset),
           getPreview(dataset, 100),
-          getGeoEligibility(dataset, geomColumn)
         ])
+
         setSchema(nextSchema)
         setResult(preview)
+
+        // AUTO DETECT GEOM COLUMN
+        const blobCol = nextSchema.columns.find(
+          c => c.type.toUpperCase() === 'BLOB'
+        )
+
+        const detectedGeom = blobCol?.name ?? 'geom'
+        setGeomColumn(detectedGeom)
+
+        const geo = await getGeoEligibility(dataset, detectedGeom)
+
         setGeoEligible(geo.eligible)
         setGeoReason(geo.reason)
+
       } catch (err) {
         setError(String(err))
       }
     })()
-  }, [dataset, geomColumn])
+  }, [dataset])
 
   async function onRegisterDataset() {
     if (!datasetId || !datasetUri) return
