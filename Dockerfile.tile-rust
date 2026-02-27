@@ -1,0 +1,24 @@
+# Rust tile service
+FROM rust:latest as tile-rust-build
+
+WORKDIR /app
+
+COPY src/tile-rust ./
+
+RUN cargo build --release
+
+# Runtime stage
+FROM debian:bookworm-slim as tile-rust
+
+ENV TILE_BIND=0.0.0.0:8090
+
+WORKDIR /app
+
+COPY --from=tile-rust-build /app/target/release/parquet-viewer-tile-service ./tile-service
+
+EXPOSE 8090
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8090/health || exit 1
+
+CMD ["./tile-service"]

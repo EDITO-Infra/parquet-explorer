@@ -201,6 +201,14 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Node
+node_modules/
+src/frontend/node_modules/
+
+# Rust
+target/
+src/tile-rust/target/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
