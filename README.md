@@ -1,171 +1,134 @@
-# parquet-viewer
+# Parquet Globe
 
-Interactive Parquet explorer service for EDITO.
+A native-Rust Parquet/GeoParquet 2 explorer with a React table + globe frontend.
 
-## v1 goals
-
-- Explore Parquet datasets (S3 or local mounted storage).
-- Run read-only SQL with guardrails through DuckDB.
-- Show schema and preview quickly.
-- Optional map tab for WKB geometry datasets.
-- Keep component boundaries stable so query/tile services can be swapped later.
-
-## Architecture (v1)
-
-- Frontend: React + Vite + TypeScript + MapLibre GL JS
-- Query API: Python + FastAPI + DuckDB
-- Tile API: separate service endpoint (Rust/Go/Python), pluggable via config
-
-This repo includes a Rust tile service scaffold at `src/tile-rust`.
-
-The frontend only talks to stable HTTP APIs:
-
-- Query API (`/api/*`) for datasets/schema/query/preview.
-- Tile API (`/tiles/*`) for map vector tiles.
-
-This means backend pieces can be replaced later without frontend rewrite.
-
-## Why not embed DuckDB UI directly?
-
-DuckDB UI is not designed as a drop-in embeddable app for this multi-tenant service shape.
-This project needs:
-
-- S3 + mounted storage controls
-- strict query guardrails
-- stable API contracts
-- map integration with WKB and external tile engines
-
-## Geo policy
-
-- Map tab requires a valid WKB geometry column.
-- Non-geo Parquet is fully supported in table/query mode.
-
-## Backend interfaces (for migration)
-
-The backend is designed around replaceable contracts:
-
-- `DatasetCatalog`: resolve dataset id -> physical location.
-- `QueryEngine`: execute safe, read-only SQL against resolved datasets.
-- `TileProvider`: produce/proxy vector tiles.
-
-You can keep the same API and swap implementations:
-
-- Python DuckDB -> Rust/Go query runtime
-- Python tile fallback -> dedicated Rust/Go tile service
-
-## Quick start (backend)
-
-1) Install deps
-
-`pip install -e .[dev]`
-
-2) Start API
-
-`uvicorn parquet_viewer_backend.main:app --host 0.0.0.0 --port 8080`
-
-3) Open API docs
-
-`http://localhost:8080/docs`
-
-## Quick start (frontend)
-
-1) Install frontend deps
-
-`cd src/frontend && npm install`
-
-2) Start dev UI
-
-`npm run dev`
-
-The dev server proxies `/api`, `/health`, and `/tiles` to `http://localhost:8080`.
-
-## Quick start (rust tile service)
-
-1) Install Rust deps
-
-`make install-rust`
-
-2) Start service
-
-`make dev-rust-tile`
-
-3) Point backend to tile service
-
-`export PV_TILE_SERVICE_URL=http://localhost:8090`
-
-## Key configuration
-
-- `PV_MAX_ROWS` (default: `10000`)
-- `PV_QUERY_TIMEOUT_S` (default: `30`)
-- `PV_DUCKDB_MEMORY_LIMIT` (default: `1GB`)
-- `PV_DUCKDB_THREADS` (default: `4`)
-- `PV_TILE_SERVICE_URL` (default: empty; if empty, tiles endpoint returns `501`)
-
-## Docker deployment (complete stack)
-
-All three services (backend, frontend, tile-rust) run in containers, networked together.
-
-### Quick Docker start
-
-1) Build all images
-
-`make docker-build`
-
-2) Start all services
-
-`make docker-up`
-
-3) Access services
-
-- Frontend: `http://localhost:3000`
-- Backend API: `http://localhost:8080`
-- Backend docs: `http://localhost:8080/docs`
-- Tile service: `http://localhost:8090/health`
-
-4) View logs
-
-`make docker-logs`
-
-5) Stop services
-
-`make docker-down`
-
-6) Clean up
-
-`make clean-docker`
-
-### Docker images
-
-- **Backend** ([Dockerfile](Dockerfile)): Python 3.11 slim + FastAPI + DuckDB. Port 8080. Healthcheck included.
-- **Frontend** ([Dockerfile.frontend](Dockerfile.frontend)): Node 20 Alpine build, served with `serve`. Port 3000. Healthcheck included.
-- **Tile service** ([Dockerfile.tile-rust](Dockerfile.tile-rust)): Rust build, small Debian runtime. Port 8090. Healthcheck included.
-
-### Docker environment
-
-The `docker-compose.yml` includes default environment variables. Override in `.env` file or via command line:
-
-```
-PV_APP_ENV=production
-PV_MAX_ROWS=10000
-PV_QUERY_TIMEOUT_S=30
-PV_DUCKDB_MEMORY_LIMIT=2GB
-PV_DUCKDB_THREADS=4
-PV_TILE_SERVICE_URL=http://tile-service:8090
+```text
+browser
+  ├─ React virtual table
+  ├─ Arrow JS
+  └─ MapLibre globe
+       │
+       │ JSON metadata / control
+       │ Arrow IPC table + spatial streams
+       ▼
+axum / Tokio
+  ├─ object_store        ranged HTTP/object-store reads
+  ├─ parquet-rs 59.2     Parquet + native GEOMETRY/GEOGRAPHY
+  └─ arrow-rs 59.2       RecordBatch + Arrow IPC
 ```
 
-All services are networked and can reach each other by container name (e.g., `http://backend:8080` from frontend).
+There is no Python, FastAPI, PyArrow, PyO3, DuckDB, or tile microservice in the request path.
 
-## Deployment notes
+## Current frontend
 
-- For EDITO shared service, set conservative limits and autoscaling.
-- For self-deployed user instances, recommend larger CPU/memory for heavy datasets.
-- A Helm chart can expose these limits as values for per-deployment tuning.
+Paste an HTTP(S) Parquet URL and the app:
 
-## Makefile shortcuts
+1. opens only the Parquet metadata first;
+2. shows schema, row counts, native GeoParquet information and row-group spatial statistics;
+3. pages the table through Arrow IPC rather than JSON rows;
+4. opens native `GEOMETRY` / `GEOGRAPHY` columns on a MapLibre globe;
+5. issues `/spatial` viewport queries as the map moves;
+6. downloads Arrow or Parquet subsets.
 
-- `make install` or `make install-all` installs Python + Node + Rust deps.
-- `make dev-backend` starts FastAPI API.
-- `make dev-frontend` starts Vite UI.
-- `make dev-rust-tile` starts Rust tile service.
+The first map adapter intentionally caps viewport results and decodes WKB to GeoJSON in the browser. This makes the scaffold usable immediately without changing the backend contract. The performance upgrade is to replace only `src/frontend/src/wkb.ts` + the MapLibre GeoJSON source with GeoArrow-Wasm + `@geoarrow/deck.gl-geoarrow`; Arrow IPC remains the transport.
 
-See [docs/architecture.md](docs/architecture.md), [docs/api.md](docs/api.md), and [DEPLOY.md](DEPLOY.md).
+## API
+
+Base path: `/api/v1`.
+
+| Endpoint | Response |
+|---|---|
+| `GET /health` | JSON |
+| `POST /datasets/open` | JSON dataset metadata |
+| `GET /datasets/{id}/metadata` | JSON |
+| `GET /datasets/{id}/schema` | JSON |
+| `POST /datasets/{id}/page` | streaming Arrow IPC |
+| `POST /datasets/{id}/spatial` | streaming Arrow IPC |
+| `POST /datasets/{id}/export` | Parquet or Arrow file |
+| `DELETE /datasets/{id}` | 204 |
+
+Example:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/datasets/open \
+  -H 'content-type: application/json' \
+  -d '{"uri":"https://example.org/data.parquet"}'
+```
+
+## GeoParquet 2
+
+The backend uses Parquet-native `GEOMETRY` and `GEOGRAPHY` logical types rather than guessing that binary columns are geometry. It also parses the GeoParquet `geo` metadata, exposes the primary geometry column, CRS/edge metadata, geometry types and row-group bounding boxes.
+
+`/spatial` currently uses **conservative row-group bounding-box pruning**. It is fast but may include feature-level false positives, and therefore reports:
+
+```text
+X-Parquet-Viewer-Spatial-Filter: row-group-bbox-candidates
+```
+
+Exact GeoRust filtering is the next backend milestone. The GeoArrow-RS main branch has moved to Arrow-RS 59, while some published 0.8 crates still declare Arrow-RS 58. The clean options are to pin a compatible GeoArrow git revision or wait for the next crates.io release; either way, the HTTP contract does not change.
+
+## Why there are no `mod.rs` files
+
+This project uses the modern flat Rust module layout:
+
+```text
+src/server/src/
+  main.rs
+  api.rs
+  config.rs
+  engine.rs
+  error.rs
+  model.rs
+  security.rs
+  engine/
+    ipc.rs
+    source.rs
+```
+
+`engine.rs` declares `mod ipc; mod source;`, so Rust loads `engine/ipc.rs` and `engine/source.rs`. The earlier scaffold used `api/mod.rs` and `engine/mod.rs`; both layouts are valid Rust, but `api.rs` / `engine.rs` is clearer for a service this size.
+
+## Run
+
+Backend:
+
+```bash
+cargo run --manifest-path src/server/Cargo.toml
+```
+
+Frontend:
+
+```bash
+cd src/frontend
+npm install
+npm run dev
+```
+
+Then open `http://localhost:5173`. Vite proxies `/api` to `http://localhost:8080`.
+
+Or use Docker:
+
+```bash
+docker compose up --build
+```
+
+and open `http://localhost:3000`.
+
+## Repository layout
+
+```text
+src/
+  server/               native axum/Arrow/Parquet backend
+  frontend/             React + Arrow JS + MapLibre globe
+deploy/
+  nginx.conf             production SPA + /api reverse proxy
+Dockerfile               backend
+Dockerfile.frontend      frontend
+```
+
+## Source security
+
+A public paste-a-URL service is an SSRF boundary. The server rejects embedded URL credentials and, by default, private/loopback/link-local/special-use HTTP targets. For production, also enforce network-layer egress restrictions; hostname validation alone cannot fully solve redirects or DNS rebinding.
+
+## Validation note
+
+This environment does not contain a Rust toolchain and cannot currently reach npm long enough to install frontend dependencies. CI is included to run `cargo check/test/clippy` and the Vite production build in a normal networked environment.

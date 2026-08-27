@@ -1,21 +1,13 @@
-# Multi-stage backend service Dockerfile
-# Backend: Python + FastAPI + DuckDB
-
-FROM python:3.11-slim as backend
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
+FROM rust:1.95-bookworm AS builder
 WORKDIR /app
+COPY src/server ./src/server
+RUN cargo build --release --manifest-path src/server/Cargo.toml
 
-COPY pyproject.toml ./
-COPY src/backend ./src/backend
-
-RUN pip install --no-cache-dir -e .
-
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/src/server/target/release/parquet-viewer-server /usr/local/bin/parquet-viewer-server
+ENV PV_HOST=0.0.0.0 PV_PORT=8080
 EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import httpx; httpx.get('http://localhost:8080/health')"
-
-CMD ["uvicorn", "parquet_viewer_backend.main:app", "--host", "0.0.0.0", "--port", "8080"]
+ENTRYPOINT ["parquet-viewer-server"]

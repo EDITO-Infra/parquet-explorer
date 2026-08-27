@@ -1,254 +1,158 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import maplibregl from 'maplibre-gl'
+import { useEffect, useMemo, useState } from 'react'
+import type { RecordBatch } from 'apache-arrow'
+import { batchRows, type PlainRow } from './arrow'
+import { closeDataset, downloadSubset, openDataset, pageBatches } from './api'
+import { DataTable } from './DataTable'
+import { MapPanel } from './MapPanel'
+import type { DatasetInfo } from './types'
 
-import { getGeoEligibility, getPreview, getSchema, listDatasets, registerDataset, runQuery } from './api'
-import type { DatasetRef, QueryResponse, SchemaResponse } from './types'
-
-type Tab = 'data' | 'map'
-
-function DataTable({ result }: { result: QueryResponse | null }) {
-  if (!result) return <p>No data loaded.</p>
-
-  return (
-    <div className="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            {result.columns.map((c) => (
-              <th key={c}>{c}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {result.rows.map((r, idx) => (
-            <tr key={idx}>
-              {r.map((v, colIdx) => (
-                <td key={colIdx}>{String(v ?? '')}</td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {result.truncated ? <p className="warn">Result truncated by server limits.</p> : null}
-    </div>
-  )
-}
-
-function MapPanel({ dataset, geomColumn }: { dataset: string; geomColumn: string }) {
-  const mapDiv = useRef<HTMLDivElement | null>(null)
-
-  useEffect(() => {
-    if (!mapDiv.current) return
-
-    const map = new maplibregl.Map({
-      container: mapDiv.current,
-      style: 'https://demotiles.maplibre.org/style.json',
-      center: [0, 20],
-      zoom: 1.5
-    })
-
-    map.on('load', () => {
-      const sourceId = 'pv-tiles'
-      const layerId = 'pv-points'
-
-      map.addSource(sourceId, {
-        type: 'vector',
-        tiles: [
-          `${API_BASE}/tiles/{z}/{x}/{y}.mvt?dataset=${encodeURIComponent(dataset)}&geom_column=${encodeURIComponent(geomColumn)}`
-        ],
-        minzoom: 0,
-        maxzoom: 14
-      })
-
-      map.addLayer({
-        id: layerId,
-        type: 'circle',
-        source: sourceId,
-        'source-layer': 'default',
-        paint: {
-          'circle-radius': 3,
-          'circle-color': '#2563eb',
-          'circle-opacity': 0.8
-        }
-      })
-    })
-
-    return () => {
-      map.remove()
-    }
-  }, [dataset, geomColumn])
-
-  return <div ref={mapDiv} className="map" />
-}
+type Tab = 'data' | 'map' | 'schema'
 
 export default function App() {
+  const [uri, setUri] = useState('')
+  const [dataset, setDataset] = useState<DatasetInfo | null>(null)
   const [tab, setTab] = useState<Tab>('data')
-  const [datasets, setDatasets] = useState<DatasetRef[]>([])
-  const [dataset, setDataset] = useState('')
-  const [schema, setSchema] = useState<SchemaResponse | null>(null)
-  const [result, setResult] = useState<QueryResponse | null>(null)
-  const [sql, setSql] = useState('SELECT * FROM __dataset LIMIT 100')
-  const [datasetId, setDatasetId] = useState('')
-  const [datasetUri, setDatasetUri] = useState('')
-  const [geomColumn, setGeomColumn] = useState('geom')
-  const [geoEligible, setGeoEligible] = useState<boolean>(false)
-  const [geoReason, setGeoReason] = useState('')
+  const [offset, setOffset] = useState(0)
+  const [limit, setLimit] = useState(1000)
+  const [rows, setRows] = useState<PlainRow[]>([])
+  const [columns, setColumns] = useState<string[]>([])
+  const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  const selectedDataset = useMemo(() => datasets.find((d) => d.id === dataset), [datasets, dataset])
-
-  async function refreshDatasets() {
-    const items = await listDatasets()
-    setDatasets(items)
-    if (!dataset && items.length > 0) {
-      setDataset(items[0].id)
-    }
-  }
-
-  useEffect(() => {
-    void refreshDatasets()
-  }, [])
+  const primaryGeo = useMemo(() => dataset?.geo_columns.find(column => column.is_primary) ?? dataset?.geo_columns[0], [dataset])
 
   useEffect(() => {
     if (!dataset) return
+    void loadPage(dataset, offset, limit)
+  }, [dataset?.dataset_id, offset, limit])
 
-    ;(async () => {
-      try {
-        setError('')
-        const [nextSchema, preview] = await Promise.all([
-          getSchema(dataset),
-          getPreview(dataset, 100),
-        ])
+  async function onOpen(event: React.FormEvent) {
+    event.preventDefault()
+    if (!uri.trim()) return
+    setLoading(true); setError('')
+    try {
+      if (dataset) await closeDataset(dataset.dataset_id).catch(() => undefined)
+      const info = await openDataset(uri.trim())
+      setDataset(info); setOffset(0); setTab(info.geo_columns.length ? 'map' : 'data')
+    } catch (err) { setError(String(err)) }
+    finally { setLoading(false) }
+  }
 
-        setSchema(nextSchema)
-        setResult(preview)
-
-        // AUTO DETECT GEOM COLUMN
-        const blobCol = nextSchema.columns.find(
-          c => c.type.toUpperCase() === 'BLOB'
-        )
-
-        const detectedGeom = blobCol?.name ?? 'geom'
-        setGeomColumn(detectedGeom)
-
-        const geo = await getGeoEligibility(dataset, detectedGeom)
-
-        setGeoEligible(geo.eligible)
-        setGeoReason(geo.reason)
-
-      } catch (err) {
-        setError(String(err))
+  async function loadPage(info: DatasetInfo, pageOffset: number, pageLimit: number) {
+    setLoading(true); setError('')
+    try {
+      const nextRows: PlainRow[] = []
+      let firstBatch: RecordBatch | null = null
+      for await (const batch of pageBatches(info.dataset_id, { offset: pageOffset, limit: pageLimit })) {
+        firstBatch ??= batch
+        nextRows.push(...batchRows(batch, pageLimit - nextRows.length))
+        if (nextRows.length >= pageLimit) break
       }
-    })()
-  }, [dataset])
-
-  async function onRegisterDataset() {
-    if (!datasetId || !datasetUri) return
-    try {
-      setError('')
-      await registerDataset(datasetId, datasetUri)
-      setDatasetId('')
-      setDatasetUri('')
-      await refreshDatasets()
-      setDataset(datasetId)
-    } catch (err) {
-      setError(String(err))
-    }
-  }
-
-  async function onRunQuery() {
-    if (!dataset) return
-    try {
-      setError('')
-      const response = await runQuery(dataset, sql, 1000)
-      setResult(response)
-    } catch (err) {
-      setError(String(err))
-    }
+      setRows(nextRows)
+      setColumns(firstBatch?.schema.fields.map(field => field.name) ?? info.columns.map(column => column.name))
+    } catch (err) { setError(String(err)) }
+    finally { setLoading(false) }
   }
 
   return (
-    <div className="app">
-      <header>
-        <h1>Parquet Viewer</h1>
-        <p>DuckDB-backed explorer with optional MapLibre vector tiles.</p>
+    <div className="app-shell">
+      <header className="topbar">
+        <div>
+          <h1>Parquet Globe</h1>
+          <p>Native Rust GeoParquet 2 explorer · Arrow IPC · globe viewport queries</p>
+        </div>
+        {dataset && <div className="dataset-pill">{dataset.num_rows.toLocaleString()} rows · {dataset.num_row_groups} row groups</div>}
       </header>
 
-      <section className="panel">
-        <h2>Register dataset</h2>
-        <div className="row">
-          <input
-            placeholder="dataset id"
-            value={datasetId}
-            onChange={(e) => setDatasetId(e.target.value)}
-          />
-          <input
-            placeholder="s3://bucket/path/*.parquet"
-            value={datasetUri}
-            onChange={(e) => setDatasetUri(e.target.value)}
-          />
-          <button onClick={onRegisterDataset}>Register</button>
-        </div>
-      </section>
+      <form className="open-bar" onSubmit={onOpen}>
+        <input value={uri} onChange={event => setUri(event.target.value)} placeholder="https://…/dataset.parquet" aria-label="Parquet URL" />
+        <button disabled={loading || !uri.trim()}>{loading ? 'Working…' : 'Open Parquet'}</button>
+      </form>
 
-      <section className="panel">
-        <div className="row">
-          <label>Dataset</label>
-          <select value={dataset} onChange={(e) => setDataset(e.target.value)}>
-            <option value="">Select dataset</option>
-            {datasets.map((d) => (
-              <option key={d.id} value={d.id}>
-                {d.id}
-              </option>
-            ))}
-          </select>
-          <label>Geometry column</label>
-          <input value={geomColumn} onChange={(e) => setGeomColumn(e.target.value)} />
-        </div>
-        {selectedDataset ? <p className="muted">{selectedDataset.uri}</p> : null}
-      </section>
+      {error && <div className="error-banner">{error}</div>}
 
-      <section className="panel tabs">
-        <button className={tab === 'data' ? 'active' : ''} onClick={() => setTab('data')}>
-          Data
-        </button>
-        <button className={tab === 'map' ? 'active' : ''} onClick={() => setTab('map')}>
-          Map
-        </button>
-      </section>
-
-      {error ? <p className="error">{error}</p> : null}
-
-      {tab === 'data' ? (
-        <section className="panel">
-          <h2>Query</h2>
-          <textarea value={sql} onChange={(e) => setSql(e.target.value)} rows={5} />
-          <div className="row">
-            <button onClick={onRunQuery}>Run query</button>
+      {!dataset ? (
+        <main className="landing">
+          <div className="landing-card">
+            <span className="eyebrow">GeoParquet 2.0</span>
+            <h2>Paste a Parquet URL.</h2>
+            <p>The backend range-reads metadata and row groups. Table data arrives as Arrow IPC; geospatial files open directly on a globe.</p>
           </div>
-
-          <h3>Schema</h3>
-          <ul>
-            {schema?.columns.map((c) => (
-              <li key={c.name}>
-                <strong>{c.name}</strong>: {c.type}
-              </li>
-            ))}
-          </ul>
-
-          <h3>Results</h3>
-          <DataTable result={result} />
-        </section>
+        </main>
       ) : (
-        <section className="panel">
-          <h2>Map</h2>
-          {geoEligible && dataset ? (
-            <MapPanel dataset={dataset} geomColumn={geomColumn} />
-          ) : (
-            <p className="warn">Map unavailable: {geoReason || 'Dataset is not geo-eligible.'}</p>
-          )}
-        </section>
+        <main className="workspace">
+          <aside className="sidebar">
+            <div className="side-section">
+              <span className="section-label">Dataset</span>
+              <div className="uri" title={dataset.uri}>{dataset.name || filename(dataset.uri)}</div>
+              <div className="muted mono">{dataset.dataset_id.slice(0, 12)}</div>
+            </div>
+            <div className="side-section stats-grid">
+              <Metric label="Rows" value={dataset.num_rows.toLocaleString()} />
+              <Metric label="Columns" value={String(dataset.columns.length)} />
+              <Metric label="Row groups" value={String(dataset.num_row_groups)} />
+              <Metric label="Geo columns" value={String(dataset.geo_columns.length)} />
+            </div>
+            {primaryGeo && <div className="side-section">
+              <span className="section-label">Spatial</span>
+              <dl className="metadata-list">
+                <dt>Column</dt><dd>{primaryGeo.name}</dd>
+                <dt>Type</dt><dd>{primaryGeo.logical_type}</dd>
+                <dt>CRS</dt><dd>{primaryGeo.crs}</dd>
+                <dt>Statistics</dt><dd>{primaryGeo.row_groups_with_bbox}/{primaryGeo.row_groups_total}</dd>
+              </dl>
+            </div>}
+            <div className="side-section">
+              <span className="section-label">Export</span>
+              <div className="button-stack">
+                <button className="secondary" onClick={() => void downloadSubset(dataset.dataset_id, 'parquet')}>Download Parquet</button>
+                <button className="secondary" onClick={() => void downloadSubset(dataset.dataset_id, 'arrow')}>Download Arrow</button>
+              </div>
+            </div>
+          </aside>
+
+          <section className="content">
+            <nav className="tabs">
+              <TabButton active={tab === 'data'} onClick={() => setTab('data')}>Data</TabButton>
+              <TabButton active={tab === 'map'} disabled={!dataset.geo_columns.length} onClick={() => setTab('map')}>Globe</TabButton>
+              <TabButton active={tab === 'schema'} onClick={() => setTab('schema')}>Schema</TabButton>
+            </nav>
+
+            {tab === 'data' && <section className="pane">
+              <div className="pane-toolbar">
+                <div className="pager">
+                  <button className="secondary" disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - limit))}>Previous</button>
+                  <span>{offset.toLocaleString()}–{Math.min(offset + rows.length, dataset.num_rows).toLocaleString()}</span>
+                  <button className="secondary" disabled={offset + limit >= dataset.num_rows || loading} onClick={() => setOffset(offset + limit)}>Next</button>
+                </div>
+                <label>Rows <select value={limit} onChange={event => { setOffset(0); setLimit(Number(event.target.value)) }}><option>250</option><option>1000</option><option>5000</option><option>10000</option></select></label>
+              </div>
+              <DataTable columns={columns} rows={rows} />
+            </section>}
+
+            {tab === 'map' && <section className="pane map-pane"><MapPanel dataset={dataset} /></section>}
+
+            {tab === 'schema' && <section className="pane schema-pane">
+              <div className="schema-summary">
+                <div><span className="section-label">GeoParquet</span><strong>{dataset.geo_parquet?.version ?? 'native geospatial Parquet / none'}</strong></div>
+                <div><span className="section-label">V2 checks</span><strong>{dataset.geo_parquet?.v2_metadata_checks_passed ? 'Passed' : 'Not confirmed'}</strong></div>
+                <div><span className="section-label">Exact spatial</span><strong>{dataset.capabilities.spatial_exact ? 'Enabled' : 'Pending GeoRust kernel'}</strong></div>
+              </div>
+              {dataset.geo_parquet?.warnings.length ? <div className="warning-box"><strong>Metadata warnings</strong>{dataset.geo_parquet.warnings.map(warning => <div key={warning}>{warning}</div>)}</div> : null}
+              <div className="schema-table">
+                <div className="schema-row schema-head"><span>Name</span><span>Arrow type</span><span>Parquet physical</span><span>Nullable</span></div>
+                {dataset.columns.map(column => <div className="schema-row" key={column.name}><span>{column.name}</span><span className="mono">{column.arrow_type}</span><span>{column.parquet_physical_type ?? '—'}</span><span>{column.nullable ? 'yes' : 'no'}</span></div>)}
+              </div>
+            </section>}
+          </section>
+        </main>
       )}
     </div>
   )
 }
+
+function TabButton({ active, disabled, onClick, children }: { active: boolean; disabled?: boolean; onClick: () => void; children: React.ReactNode }) {
+  return <button className={active ? 'active' : ''} disabled={disabled} onClick={onClick}>{children}</button>
+}
+function Metric({ label, value }: { label: string; value: string }) { return <div><span className="metric-value">{value}</span><span className="metric-label">{label}</span></div> }
+function filename(uri: string) { try { return new URL(uri).pathname.split('/').filter(Boolean).pop() ?? uri } catch { return uri } }
