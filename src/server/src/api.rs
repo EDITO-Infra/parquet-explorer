@@ -98,7 +98,6 @@ async fn page(
     Path(dataset_id): Path<String>,
     Json(mut payload): Json<PageRequest>,
 ) -> Result<Response, ApiError> {
-    reject_filters(&payload.filters)?;
     if !payload.sort.is_empty() {
         return Err(ApiError::not_implemented(
             "global sorting is reserved in the API contract but not implemented yet",
@@ -123,7 +122,6 @@ async fn spatial(
     Path(dataset_id): Path<String>,
     Json(mut payload): Json<SpatialRequest>,
 ) -> Result<Response, ApiError> {
-    reject_filters(&payload.filters)?;
     if payload.max_features == 0 {
         return Err(ApiError::bad_request("max_features must be at least 1"));
     }
@@ -151,7 +149,6 @@ async fn export(
     Path(dataset_id): Path<String>,
     Json(payload): Json<ExportRequest>,
 ) -> Result<Response, ApiError> {
-    reject_filters(&payload.filters)?;
     if payload.limit == Some(0) {
         return Err(ApiError::bad_request("limit must be at least 1"));
     }
@@ -211,16 +208,6 @@ async fn close_dataset(
         .close_dataset(&dataset_id)
         .map_err(ApiError::from_engine)?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-fn reject_filters(filters: &[crate::model::FilterClause]) -> Result<(), ApiError> {
-    if filters.is_empty() {
-        Ok(())
-    } else {
-        Err(ApiError::not_implemented(
-            "column filters are reserved in the API contract but not implemented yet",
-        ))
-    }
 }
 
 fn streaming_arrow_response<S>(

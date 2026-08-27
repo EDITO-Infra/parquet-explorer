@@ -18,7 +18,7 @@ impl ApiError {
         let message = format!("{error:#}");
         if message.contains("dataset not found") {
             Self { status: StatusCode::NOT_FOUND, message }
-        } else if message.contains("unknown column") || message.contains("bbox") || message.contains("geometry") || message.contains("maximum number") {
+        } else if message.contains("unknown column") || message.contains("filter") || message.contains("bbox") || message.contains("geometry") || message.contains("maximum number") {
             Self::bad_request(message)
         } else {
             tracing::error!(error = %message, "engine error");

@@ -73,7 +73,7 @@ impl Default for Capabilities {
             paging: true,
             spatial_row_group_pruning: true,
             spatial_exact: false,
-            filters: false,
+            filters: true,
             sorting: false,
             export_arrow: true,
             export_parquet: true,
@@ -86,10 +86,25 @@ pub struct DatasetEntry {
     pub info: DatasetInfo,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterOp {
+    Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    Contains,
+    IsNull,
+    IsNotNull,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct FilterClause {
     pub column: String,
-    pub op: String,
+    pub op: FilterOp,
+    #[serde(default)]
     pub value: serde_json::Value,
 }
 

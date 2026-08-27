@@ -1,23 +1,29 @@
+mod filter;
 mod ipc;
 mod source;
 
-use std::{collections::{HashMap, HashSet}, fs::File, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::RwLock;
-use serde::Deserialize;
 use parquet::{
     arrow::{ProjectionMask, arrow_writer::ArrowWriter},
     basic::LogicalType,
     file::metadata::ParquetMetaData,
 };
-use tempfile::{TempPath, NamedTempFile};
+use serde::Deserialize;
+use tempfile::{NamedTempFile, TempPath};
 use uuid::Uuid;
 
 use crate::model::{
     Capabilities, ColumnInfo, DatasetEntry, DatasetInfo, ExportFormat, ExportRequest,
     GeoColumnInfo, GeoParquetInfo, PageRequest, SpatialRequest,
 };
+use filter::apply_filters;
 use ipc::{IpcByteStream, spawn_ipc_stream};
 use source::{ReaderBuilder, builder_for_uri};
 
@@ -79,11 +85,14 @@ impl CoreEngine {
     pub async fn page_stream(&self, dataset_id: &str, req: PageRequest) -> Result<IpcByteStream> {
         let entry = self.entry(dataset_id)?;
         let builder = builder_for_uri(&entry.info.uri).await?;
+        let builder = apply_filters(builder, &req.filters)?;
         let builder = apply_projection(builder, req.columns.as_deref())?
             .with_offset(req.offset)
             .with_limit(req.limit)
             .with_batch_size(self.batch_size);
-        let stream = builder.build().context("could not build Parquet page reader")?;
+        let stream = builder
+            .build()
+            .context("could not build Parquet page reader")?;
         let schema = Arc::clone(stream.schema());
         Ok(spawn_ipc_stream(stream, schema, self.ipc_channel_capacity))
     }
@@ -105,6 +114,7 @@ impl CoreEngine {
 
         let builder = builder_for_uri(&entry.info.uri).await?;
         let row_groups = intersecting_row_groups(builder.metadata(), &geometry, req.bbox)?;
+        let builder = apply_filters(builder, &req.filters)?;
         let builder = apply_projection(builder, requested.as_deref())?
             .with_row_groups(row_groups)
             .with_limit(req.max_features)
@@ -125,6 +135,7 @@ impl CoreEngine {
 
         let entry = self.entry(dataset_id)?;
         let mut builder = builder_for_uri(&entry.info.uri).await?;
+        builder = apply_filters(builder, &req.filters)?;
         builder = apply_projection(builder, req.columns.as_deref())?
             .with_offset(req.offset)
             .with_batch_size(self.batch_size);
@@ -158,7 +169,9 @@ impl CoreEngine {
                     .context("could not create Parquet export writer")?;
                 use futures::TryStreamExt;
                 while let Some(batch) = stream.try_next().await.context("export read failed")? {
-                    writer.write(&batch).context("Parquet export write failed")?;
+                    writer
+                        .write(&batch)
+                        .context("Parquet export write failed")?;
                 }
                 writer.close().context("Parquet export finalize failed")?;
                 Ok(ExportArtifact {
@@ -179,7 +192,10 @@ impl CoreEngine {
     }
 }
 
-fn apply_projection(mut builder: ReaderBuilder, columns: Option<&[String]>) -> Result<ReaderBuilder> {
+fn apply_projection(
+    mut builder: ReaderBuilder,
+    columns: Option<&[String]>,
+) -> Result<ReaderBuilder> {
     let Some(columns) = columns else {
         return Ok(builder);
     };
@@ -206,19 +222,28 @@ fn apply_projection(mut builder: ReaderBuilder, columns: Option<&[String]>) -> R
 }
 
 fn choose_geometry_column(info: &DatasetInfo, requested: Option<&str>) -> Result<String> {
-    if let Some(requested) = requested {
-        if info.geo_columns.iter().any(|column| column.name == requested) {
-            return Ok(requested.to_string());
-        }
-        bail!("not a GeoParquet 2 geometry/geography column: {requested}");
-    }
-
-    if let Some(primary) = info
+    let metadata_primary = info
         .geo_parquet
         .as_ref()
-        .map(|metadata| metadata.primary_column.as_str())
-    {
-        if info.geo_columns.iter().any(|column| column.name == primary) {
+        .map(|metadata| metadata.primary_column.as_str());
+
+    if let Some(requested) = requested {
+        if info
+            .geo_columns
+            .iter()
+            .any(|column| column.name == requested)
+            || (metadata_primary == Some(requested)
+                && info.columns.iter().any(|column| column.name == requested))
+        {
+            return Ok(requested.to_string());
+        }
+        bail!("not a recognized geospatial column: {requested}");
+    }
+
+    if let Some(primary) = metadata_primary {
+        if info.geo_columns.iter().any(|column| column.name == primary)
+            || info.columns.iter().any(|column| column.name == primary)
+        {
             return Ok(primary.to_string());
         }
     }
@@ -226,7 +251,7 @@ fn choose_geometry_column(info: &DatasetInfo, requested: Option<&str>) -> Result
     info.geo_columns
         .first()
         .map(|column| column.name.clone())
-        .ok_or_else(|| anyhow!("dataset has no native GEOMETRY/GEOGRAPHY column"))
+        .ok_or_else(|| anyhow!("dataset has no recognized geospatial column"))
 }
 
 fn validate_bbox(bbox: [f64; 4]) -> Result<()> {
@@ -257,9 +282,17 @@ fn intersecting_row_groups(
     let mut row_groups = Vec::new();
     for (index, row_group) in metadata.row_groups().iter().enumerate() {
         let column = row_group.column(leaf_index);
-        let include = match column.geo_statistics().and_then(|stats| stats.bounding_box()) {
+        let include = match column
+            .geo_statistics()
+            .and_then(|stats| stats.bounding_box())
+        {
             Some(bbox) => bbox_intersects(
-                [bbox.get_xmin(), bbox.get_ymin(), bbox.get_xmax(), bbox.get_ymax()],
+                [
+                    bbox.get_xmin(),
+                    bbox.get_ymin(),
+                    bbox.get_xmax(),
+                    bbox.get_ymax(),
+                ],
                 query,
             ),
             // Missing statistics must be retained for conservative correctness.
@@ -286,7 +319,7 @@ fn build_dataset_info(
     let schema_descr = metadata.file_metadata().schema_descr();
     let geo_metadata = parse_geo_metadata(metadata)?;
 
-    let columns = builder
+    let columns: Vec<ColumnInfo> = builder
         .schema()
         .fields()
         .iter()
@@ -295,10 +328,10 @@ fn build_dataset_info(
                 .columns()
                 .iter()
                 .find(|column| {
-                    column.path().parts().first().map(String::as_str)
-                        == Some(field.name().as_str())
+                    column.path().parts().first().map(String::as_str) == Some(field.name().as_str())
                 })
                 .map(|column| format!("{:?}", column.physical_type()));
+
             ColumnInfo {
                 name: field.name().to_string(),
                 arrow_type: format!("{:?}", field.data_type()),
@@ -381,6 +414,113 @@ fn build_dataset_info(
         });
     }
 
+    // GeoParquet 1.x stores WKB in ordinary BYTE_ARRAY/Binary columns and
+    // declares their spatial meaning only in the file-level `geo` metadata.
+    // Treat these as renderable geo columns as well, while keeping v2
+    // conformance checks separate below.
+    if let Some(metadata_geo) = geo_metadata.as_ref() {
+        let existing = geo_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<HashSet<_>>();
+
+        for (column_name, column_metadata) in &metadata_geo.columns {
+            if existing.contains(column_name.as_str()) {
+                continue;
+            }
+            if !column_metadata.encoding.eq_ignore_ascii_case("WKB") {
+                continue;
+            }
+
+            let exists_in_schema = builder
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| field.name() == column_name);
+            if !exists_in_schema {
+                continue;
+            }
+
+            let metadata_bbox = column_metadata.bbox.clone();
+            let dataset_bbox = metadata_bbox
+                .as_deref()
+                .and_then(metadata_bbox_xy)
+                .map(Vec::from);
+
+            geo_columns.push(GeoColumnInfo {
+                name: column_name.clone(),
+                logical_type: "WKB".to_string(),
+                crs: "OGC:CRS84".to_string(),
+                edge_interpolation: Some(
+                    column_metadata
+                        .edges
+                        .clone()
+                        .unwrap_or_else(|| "planar".to_string())
+                        .to_ascii_uppercase(),
+                ),
+                is_primary: metadata_geo.primary_column == *column_name,
+                geometry_types: column_metadata.geometry_types.clone(),
+                orientation: column_metadata.orientation.clone(),
+                epoch: column_metadata.epoch,
+                metadata_bbox,
+                row_groups_with_bbox: 0,
+                row_groups_total: metadata.num_row_groups(),
+                dataset_bbox,
+            });
+        }
+    }
+
+    // GLOBE_COMPAT_VERSION: 2026-08-27-wkb-primary-v3
+    // GeoParquet 1.x commonly stores the primary geometry as plain
+    // BYTE_ARRAY/Binary WKB. If file-level geo metadata names a primary
+    // column and that column is binary, expose it as a renderable WKB geo
+    // column even when it has no native Parquet GEOMETRY/GEOGRAPHY type.
+    if let Some(metadata_geo) = geo_metadata.as_ref() {
+        let primary = metadata_geo.primary_column.as_str();
+        let already_known = geo_columns.iter().any(|column| column.name == primary);
+
+        if !already_known {
+            if let Some(schema_column) = columns.iter().find(|column| column.name == primary) {
+                let binary = matches!(
+                    schema_column.arrow_type.as_str(),
+                    "Binary" | "LargeBinary" | "BinaryView"
+                ) || schema_column.parquet_physical_type.as_deref()
+                    == Some("BYTE_ARRAY");
+
+                if binary {
+                    let column_metadata = metadata_geo.columns.get(primary);
+                    let metadata_bbox = column_metadata.and_then(|column| column.bbox.clone());
+                    let dataset_bbox = metadata_bbox
+                        .as_deref()
+                        .and_then(metadata_bbox_xy)
+                        .map(Vec::from);
+
+                    geo_columns.push(GeoColumnInfo {
+                        name: primary.to_string(),
+                        logical_type: "WKB".to_string(),
+                        crs: "OGC:CRS84".to_string(),
+                        edge_interpolation: Some(
+                            column_metadata
+                                .and_then(|column| column.edges.clone())
+                                .unwrap_or_else(|| "planar".to_string())
+                                .to_ascii_uppercase(),
+                        ),
+                        is_primary: true,
+                        geometry_types: column_metadata
+                            .map(|column| column.geometry_types.clone())
+                            .unwrap_or_default(),
+                        orientation: column_metadata.and_then(|column| column.orientation.clone()),
+                        epoch: column_metadata.and_then(|column| column.epoch),
+                        metadata_bbox,
+                        row_groups_with_bbox: 0,
+                        row_groups_total: metadata.num_row_groups(),
+                        dataset_bbox,
+                    });
+                }
+            }
+        }
+    }
+
     let geo_parquet = build_geo_parquet_info(geo_metadata.as_ref(), &geo_columns);
 
     Ok(DatasetInfo {
@@ -442,6 +582,7 @@ fn build_geo_parquet_info(
     let metadata = metadata?;
     let native_names = geo_columns
         .iter()
+        .filter(|column| matches!(column.logical_type.as_str(), "GEOMETRY" | "GEOGRAPHY"))
         .map(|column| column.name.as_str())
         .collect::<HashSet<_>>();
     let mut warnings = Vec::new();
@@ -480,9 +621,7 @@ fn build_geo_parquet_info(
         }
         if let Some(bbox) = column.bbox.as_deref() {
             if !matches!(bbox.len(), 4 | 6 | 8) || bbox.iter().any(|value| !value.is_finite()) {
-                warnings.push(format!(
-                    "geo metadata column '{name}' has an invalid bbox"
-                ));
+                warnings.push(format!("geo metadata column '{name}' has an invalid bbox"));
             }
         }
         if column.epoch.is_some_and(|epoch| !epoch.is_finite()) {

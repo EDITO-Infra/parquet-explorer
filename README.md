@@ -65,7 +65,7 @@ The backend uses Parquet-native `GEOMETRY` and `GEOGRAPHY` logical types rather 
 X-Parquet-Viewer-Spatial-Filter: row-group-bbox-candidates
 ```
 
-Exact GeoRust filtering is the next backend milestone. The GeoArrow-RS main branch has moved to Arrow-RS 59, while some published 0.8 crates still declare Arrow-RS 58. The clean options are to pin a compatible GeoArrow git revision or wait for the next crates.io release; either way, the HTTP contract does not change.
+Exact GeoRust geometry filtering remains the next spatial milestone; the ordinary table filter path is already implemented with native Arrow/Parquet predicates.
 
 ## Why there are no `mod.rs` files
 
@@ -113,6 +113,12 @@ docker compose up --build
 
 and open `http://localhost:3000`.
 
+
+## Testing
+
+https://s3.waw3-1.cloudferro.com/emodnet/emodnet_biology/12639/marine_biodiversity_observations_occurrence_2026-08-19.parquet
+
+IMISDatasetId = 9064
 ## Repository layout
 
 ```text
@@ -132,3 +138,9 @@ A public paste-a-URL service is an SSRF boundary. The server rejects embedded UR
 ## Validation note
 
 This environment does not contain a Rust toolchain and cannot currently reach npm long enough to install frontend dependencies. CI is included to run `cargo check/test/clippy` and the Vite production build in a normal networked environment.
+
+## Table filtering
+
+The Data tab supports server-side filters with `=`, `!=`, `<`, `<=`, `>`, `>=`, `contains`, `is null`, and `is not null`. Multiple filters are ANDed. Filters are compiled to Parquet-RS `RowFilter` predicates, so paging happens over matching rows and filter columns do not have to be part of the output projection. Arrow and Parquet exports inherit the active Data-tab filters.
+
+`contains` is case-sensitive and intended for string columns. Exact matching should be preferred on very large files when possible.

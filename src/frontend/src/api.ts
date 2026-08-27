@@ -1,5 +1,5 @@
 import { RecordBatch, RecordBatchReader } from 'apache-arrow'
-import type { DatasetInfo, PageRequest, SpatialRequest } from './types'
+import type { DatasetInfo, FilterClause, PageRequest, SpatialRequest } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')
 const V1 = `${API_BASE}/api/v1`
@@ -41,36 +41,23 @@ export async function* spatialBatches(datasetId: string, request: SpatialRequest
   yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/spatial`, request)
 }
 
-async function* arrowRequest(
-  url: string,
-  payload: unknown,
-): AsyncGenerator<RecordBatch> {
+async function* arrowRequest(url: string, payload: unknown): AsyncGenerator<RecordBatch> {
   const response = await expectOk(await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
   }))
-
-  if (!response.body) {
-    throw new Error('Server returned an empty Arrow response')
-  }
+  if (!response.body) throw new Error('Server returned an empty Arrow response')
 
   const reader = await RecordBatchReader.from(streamBytes(response.body))
-
-  for await (const batch of reader) {
-    yield batch
-  }
+  for await (const batch of reader) yield batch
 }
 
-async function* streamBytes(
-  stream: ReadableStream<Uint8Array>,
-): AsyncGenerator<Uint8Array> {
+async function* streamBytes(stream: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
   const reader = stream.getReader()
-
   try {
     while (true) {
       const { value, done } = await reader.read()
-
       if (done) return
       if (value) yield value
     }
@@ -83,11 +70,11 @@ export function exportUrl(datasetId: string): string {
   return `${V1}/datasets/${encodeURIComponent(datasetId)}/export`
 }
 
-export async function downloadSubset(datasetId: string, format: 'parquet' | 'arrow', columns?: string[]): Promise<void> {
+export async function downloadSubset(datasetId: string, format: 'parquet' | 'arrow', columns?: string[], filters: FilterClause[] = []): Promise<void> {
   const response = await expectOk(await fetch(exportUrl(datasetId), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ format, columns }),
+    body: JSON.stringify({ format, columns, filters }),
   }))
   const blob = await response.blob()
   const disposition = response.headers.get('content-disposition') ?? ''

@@ -51,10 +51,19 @@ export interface DatasetInfo {
   capabilities: Capabilities
 }
 
+export type FilterOp = 'eq' | 'neq' | 'lt' | 'lte' | 'gt' | 'gte' | 'contains' | 'is_null' | 'is_not_null'
+
+export interface FilterClause {
+  column: string
+  op: FilterOp
+  value?: string | number | boolean | null
+}
+
 export interface PageRequest {
   columns?: string[]
   offset: number
   limit: number
+  filters?: FilterClause[]
 }
 
 export interface SpatialRequest {
@@ -62,4 +71,5 @@ export interface SpatialRequest {
   geometry_column?: string
   columns?: string[]
   max_features: number
+  filters?: FilterClause[]
 }
