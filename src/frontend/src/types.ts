@@ -59,6 +59,25 @@ export interface FilterClause {
   value?: string | number | boolean | null
 }
 
+export interface SnapshotRequest {
+  columns?: string[]
+  filters?: FilterClause[]
+}
+
+export interface MapSnapshotSpec {
+  id: number
+  filters: FilterClause[]
+  expectedRows: number
+}
+
+export interface CountRequest {
+  filters?: FilterClause[]
+}
+
+export interface CountResponse {
+  count: number
+}
+
 export interface PageRequest {
   columns?: string[]
   offset: number

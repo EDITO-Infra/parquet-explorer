@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/DataTable.tsx","./src/FilterBar.tsx","./src/MapPanel.tsx","./src/api.ts","./src/arrow.ts","./src/geo.ts","./src/main.tsx","./src/types.ts","./src/vite-env.d.ts","./src/wkb.ts"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/ColumnPicker.tsx","./src/DataTable.tsx","./src/FilterBar.tsx","./src/MapPanel.tsx","./src/api.ts","./src/arrow.ts","./src/geo.ts","./src/main.tsx","./src/spatial.ts","./src/types.ts","./src/vite-env.d.ts","./src/wkb.ts"],"errors":true,"version":"5.8.3"}

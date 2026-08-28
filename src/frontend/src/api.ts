@@ -1,5 +1,5 @@
 import { RecordBatch, RecordBatchReader } from 'apache-arrow'
-import type { DatasetInfo, FilterClause, PageRequest, SpatialRequest } from './types'
+import type { CountResponse, DatasetInfo, FilterClause, PageRequest, SnapshotRequest, SpatialRequest } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')
 const V1 = `${API_BASE}/api/v1`
@@ -35,6 +35,20 @@ export async function closeDataset(datasetId: string): Promise<void> {
 
 export async function* pageBatches(datasetId: string, request: PageRequest): AsyncGenerator<RecordBatch> {
   yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/page`, request)
+}
+
+export async function* snapshotBatches(datasetId: string, request: SnapshotRequest): AsyncGenerator<RecordBatch> {
+  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/snapshot`, request)
+}
+
+export async function countRows(datasetId: string, filters: FilterClause[] = []): Promise<number> {
+  const response = await expectOk(await fetch(`${V1}/datasets/${encodeURIComponent(datasetId)}/count`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ filters }),
+  }))
+  const body = await response.json() as CountResponse
+  return body.count
 }
 
 export async function* spatialBatches(datasetId: string, request: SpatialRequest): AsyncGenerator<RecordBatch> {

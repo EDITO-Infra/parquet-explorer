@@ -17,8 +17,8 @@ use crate::{
     AppState,
     error::ApiError,
     model::{
-        DatasetInfo, DatasetOpenRequest, ExportRequest, HealthResponse, PageRequest,
-        SchemaResponse, SpatialRequest,
+        CountRequest, CountResponse, DatasetInfo, DatasetOpenRequest, ExportRequest, HealthResponse,
+        PageRequest, SchemaResponse, SnapshotRequest, SpatialRequest,
     },
     security::validate_source_uri,
 };
@@ -32,6 +32,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/datasets/{dataset_id}/metadata", get(metadata))
         .route("/datasets/{dataset_id}/schema", get(schema))
         .route("/datasets/{dataset_id}/page", post(page))
+        .route("/datasets/{dataset_id}/count", post(count))
+        .route("/datasets/{dataset_id}/snapshot", post(snapshot))
         .route("/datasets/{dataset_id}/spatial", post(spatial))
         .route("/datasets/{dataset_id}/export", post(export))
         .route("/datasets/{dataset_id}", delete(close_dataset))
@@ -106,7 +108,12 @@ async fn page(
     if payload.limit == 0 {
         return Err(ApiError::bad_request("limit must be at least 1"));
     }
-    payload.limit = payload.limit.min(state.settings.max_page_size);
+    let max_page_size = state.settings.max_page_size.min(10_000);
+    if payload.limit > max_page_size {
+        return Err(ApiError::bad_request(format!(
+            "limit must not exceed {max_page_size} rows per page"
+        )));
+    }
 
     let stream = state
         .engine
@@ -115,6 +122,33 @@ async fn page(
         .map_err(ApiError::from_engine)?;
 
     Ok(streaming_arrow_response(stream, None))
+}
+
+async fn snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(dataset_id): Path<String>,
+    Json(payload): Json<SnapshotRequest>,
+) -> Result<Response, ApiError> {
+    let stream = state
+        .engine
+        .snapshot_stream(&dataset_id, payload)
+        .await
+        .map_err(ApiError::from_engine)?;
+
+    Ok(streaming_arrow_response(stream, None))
+}
+
+async fn count(
+    State(state): State<Arc<AppState>>,
+    Path(dataset_id): Path<String>,
+    Json(payload): Json<CountRequest>,
+) -> Result<Json<CountResponse>, ApiError> {
+    let count = state
+        .engine
+        .count_rows(&dataset_id, payload)
+        .await
+        .map_err(ApiError::from_engine)?;
+    Ok(Json(CountResponse { count }))
 }
 
 async fn spatial(

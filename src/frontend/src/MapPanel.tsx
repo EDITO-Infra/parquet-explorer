@@ -6,64 +6,139 @@ import {
 } from 'maplibre-gl'
 import type {
   GeoJSONSource,
-  LngLatBounds,
   Map as MapLibreMap,
+  MapGeoJSONFeature,
 } from 'maplibre-gl'
 import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
-import type { Feature, FeatureCollection, Geometry } from 'geojson'
-import { pageBatches, spatialBatches } from './api'
-import { plainValue } from './arrow'
-import { parseWkb } from './wkb'
-import type { DatasetInfo, FilterClause } from './types'
-import type {
-  CoordinateSpatialSource,
-  GeometrySpatialSource,
-  SpatialSource,
-} from './spatial'
+import type { Feature, FeatureCollection, Geometry, Position } from 'geojson'
+import { snapshotBatches } from './api'
+import type { DatasetInfo, MapSnapshotSpec } from './types'
+import type { SpatialSource } from './spatial'
+import { appendSpatialBatchFeatures, selectMapPropertyColumns, spatialColumnNames } from './spatialFeatures'
 
 setWorkerUrl(workerUrl)
 
 const SOURCE_ID = 'parquet-features'
+const FEATURE_LAYER_IDS = ['pv-polygons', 'pv-lines', 'pv-points'] as const
+const SELECTED_LAYER_IDS = ['pv-polygons-selected', 'pv-lines-selected', 'pv-points-selected'] as const
 const EMPTY: FeatureCollection = { type: 'FeatureCollection', features: [] }
 
-// Keep the initial interaction fast. This is intentionally much smaller than
-// the old 20k synchronous WKB -> GeoJSON path.
-const MAP_FEATURE_LIMIT = 3_000
+const BASEMAPS = {
+  positron: {
+    label: 'Light',
+    style: 'https://tiles.openfreemap.org/styles/positron',
+  },
+  liberty: {
+    label: 'Streets',
+    style: 'https://tiles.openfreemap.org/styles/liberty',
+  },
+  dark: {
+    label: 'Dark',
+    style: 'https://tiles.openfreemap.org/styles/dark',
+  },
+} as const
+
+type BasemapId = keyof typeof BASEMAPS
+type ProjectionMode = 'mercator' | 'globe'
+type Theme = 'light' | 'dark'
+type FeatureId = string | number
+
+type SelectionBox = {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+type BoundsAccumulator = {
+  west: number
+  south: number
+  east: number
+  north: number
+  valid: boolean
+}
 
 export function MapPanel({
   dataset,
   source,
-  filters = [],
+  snapshot,
+  seedFeatures,
+  theme,
+  active,
 }: {
   dataset: DatasetInfo
   source: SpatialSource
-  filters?: FilterClause[]
+  snapshot: MapSnapshotSpec
+  seedFeatures: Feature[]
+  theme: Theme
+  active: boolean
 }) {
+  const initialBasemap: BasemapId = theme === 'dark' ? 'dark' : 'positron'
   const container = useRef<HTMLDivElement | null>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
   const requestId = useRef(0)
-  const refreshRef = useRef<((map: MapLibreMap) => Promise<void>) | null>(null)
-  const filtersRef = useRef(filters)
+  const featuresRef = useRef<Feature[]>([])
+  const selectedIdsRef = useRef<FeatureId[]>([])
+  const projectionRef = useRef<ProjectionMode>('mercator')
+  const basemapRef = useRef<BasemapId>(initialBasemap)
+  const basemapAutomatic = useRef(true)
+  const boxSelectRef = useRef(false)
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null)
 
   const [featureCount, setFeatureCount] = useState(0)
-  const [status, setStatus] = useState('Initializing globe…')
+  const [processedRows, setProcessedRows] = useState(0)
+  const [status, setStatus] = useState('Initializing map…')
+  const [projection, setProjection] = useState<ProjectionMode>('mercator')
+  const [basemap, setBasemap] = useState<BasemapId>(initialBasemap)
+  const [boxSelect, setBoxSelect] = useState(false)
+  const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null)
+  const [selectedIds, setSelectedIds] = useState<FeatureId[]>([])
+  const [selectedProperties, setSelectedProperties] = useState<Record<string, unknown> | null>(null)
 
   useEffect(() => {
-    filtersRef.current = filters
+    if (!active) return
+    const frame = window.requestAnimationFrame(() => mapRef.current?.resize())
+    return () => window.cancelAnimationFrame(frame)
+  }, [active])
 
+  useEffect(() => {
+    if (!basemapAutomatic.current) return
+    const next: BasemapId = theme === 'dark' ? 'dark' : 'positron'
+    if (next === basemapRef.current) return
+
+    basemapRef.current = next
+    setBasemap(next)
+    mapRef.current?.setStyle(BASEMAPS[next].style)
+  }, [theme])
+
+  useEffect(() => {
+    selectedIdsRef.current = selectedIds
     const map = mapRef.current
-    const refresh = refreshRef.current
-    if (map && refresh && map.loaded()) {
-      void refresh(map)
+    if (map) setSelectionFilter(map, selectedIds)
+  }, [selectedIds])
+
+  useEffect(() => {
+    boxSelectRef.current = boxSelect
+    const map = mapRef.current
+    if (!map) return
+
+    if (boxSelect) {
+      map.dragPan.disable()
+      map.getCanvas().style.cursor = 'crosshair'
+    } else {
+      map.dragPan.enable()
+      map.getCanvas().style.cursor = ''
+      dragStartRef.current = null
+      setSelectionBox(null)
     }
-  }, [filters])
+  }, [boxSelect])
 
   useEffect(() => {
     if (!container.current) return
 
     const map = new Map({
       container: container.current,
-      style: 'https://demotiles.maplibre.org/globe.json',
+      style: BASEMAPS[basemapRef.current].style,
       center: [0, 20],
       zoom: 1.4,
       attributionControl: { compact: true },
@@ -72,123 +147,166 @@ export function MapPanel({
     mapRef.current = map
     map.addControl(new NavigationControl(), 'top-right')
 
-    async function refreshViewport(mapInstance: MapLibreMap) {
-      const thisRequest = ++requestId.current
-      setStatus('Loading viewport…')
-
-      try {
-        const features = source.kind === 'coordinates'
-          ? await loadCoordinateFeatures(
-              dataset,
-              source,
-              mapInstance,
-              filtersRef.current,
-              thisRequest,
-              requestId,
-              setProgress,
-            )
-          : await loadGeometryFeatures(
-              dataset,
-              source,
-              mapInstance,
-              filtersRef.current,
-              thisRequest,
-              requestId,
-              setProgress,
-            )
-
-        if (thisRequest !== requestId.current) return
-
-        setMapFeatures(mapInstance, features)
-        setFeatureCount(features.length)
-        setStatus(
-          source.kind === 'coordinates'
-            ? 'Exact coordinate viewport'
-            : dataset.capabilities.spatial_exact
-              ? 'Exact geometry viewport'
-              : 'Geometry row-group candidates',
-        )
-      } catch (error) {
-        if (thisRequest === requestId.current) {
-          setStatus(String(error))
-        }
-      }
-
-      function setProgress(features: Feature[]) {
-        if (thisRequest !== requestId.current) return
-        setMapFeatures(mapInstance, features)
-        setFeatureCount(features.length)
-        setStatus(`Loading viewport… ${features.length.toLocaleString()} features`)
-      }
+    const restoreOverlay = () => {
+      ensureParquetLayers(map)
+      map.setProjection({ type: projectionRef.current })
+      setMapFeatures(map, featuresRef.current)
+      setSelectionFilter(map, selectedIdsRef.current)
     }
 
-    refreshRef.current = refreshViewport
+    map.on('style.load', restoreOverlay)
 
-    map.on('load', () => {
-      // The globe style already uses globe projection, but setting it explicitly
-      // keeps this component correct if the style URL changes later.
-      map.setProjection({ type: 'globe' })
+    map.on('click', event => {
+      if (boxSelectRef.current || dragStartRef.current) return
+      const layers = availableFeatureLayers(map)
+      if (layers.length === 0) return
+      const hit = map.queryRenderedFeatures(event.point, { layers })
+        .find(feature => feature.id != null)
 
-      map.addSource(SOURCE_ID, {
-        type: 'geojson',
-        data: EMPTY,
-      })
-
-      map.addLayer({
-        id: 'pv-polygons',
-        type: 'fill',
-        source: SOURCE_ID,
-        filter: ['in', ['geometry-type'], ['literal', ['Polygon', 'MultiPolygon']]],
-        paint: {
-          'fill-color': '#2f80ed',
-          'fill-opacity': 0.34,
-        },
-      })
-
-      map.addLayer({
-        id: 'pv-lines',
-        type: 'line',
-        source: SOURCE_ID,
-        filter: ['in', ['geometry-type'], ['literal', ['LineString', 'MultiLineString']]],
-        paint: {
-          'line-color': '#57a0ff',
-          'line-width': 1.5,
-          'line-opacity': 0.8,
-        },
-      })
-
-      map.addLayer({
-        id: 'pv-points',
-        type: 'circle',
-        source: SOURCE_ID,
-        filter: ['in', ['geometry-type'], ['literal', ['Point', 'MultiPoint']]],
-        paint: {
-          'circle-color': '#68d7ff',
-          'circle-radius': 3.2,
-          'circle-opacity': 0.78,
-        },
-      })
-
-      if (source.kind === 'geometry') {
-        fitGeometryDataset(map, source)
+      if (!hit || hit.id == null) {
+        setSelectedIds([])
+        setSelectedProperties(null)
+        return
       }
 
-      void refreshViewport(map)
-      map.on('moveend', () => void refreshViewport(map))
+      setSelectedIds([hit.id])
+      setSelectedProperties(featureProperties(hit))
+    })
+
+    map.on('mousedown', event => {
+      if (!boxSelectRef.current) return
+      event.preventDefault()
+      dragStartRef.current = { x: event.point.x, y: event.point.y }
+      setSelectionBox({ left: event.point.x, top: event.point.y, width: 0, height: 0 })
+    })
+
+    map.on('mousemove', event => {
+      const start = dragStartRef.current
+      if (!boxSelectRef.current || !start) return
+      setSelectionBox(rectangleFromPoints(start, event.point))
+    })
+
+    map.on('mouseup', event => {
+      const start = dragStartRef.current
+      if (!boxSelectRef.current || !start) return
+
+      const end = { x: event.point.x, y: event.point.y }
+      dragStartRef.current = null
+      setSelectionBox(null)
+
+      const left = Math.min(start.x, end.x)
+      const right = Math.max(start.x, end.x)
+      const top = Math.min(start.y, end.y)
+      const bottom = Math.max(start.y, end.y)
+
+      if (right - left < 3 || bottom - top < 3) return
+
+      const layers = availableFeatureLayers(map)
+      if (layers.length === 0) return
+      const hits = map.queryRenderedFeatures(
+        [[left, top], [right, bottom]],
+        { layers },
+      )
+      const ids = uniqueFeatureIds(hits)
+      setSelectedIds(ids)
+      setSelectedProperties(ids.length === 1
+        ? featureProperties(hits.find(feature => feature.id === ids[0]))
+        : null)
     })
 
     return () => {
       requestId.current += 1
-      refreshRef.current = null
       map.remove()
       mapRef.current = null
     }
   }, [dataset.dataset_id, source])
 
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    const thisRequest = ++requestId.current
+    const seed = seedFeatures.slice()
+    featuresRef.current = seed
+    selectedIdsRef.current = []
+    setFeatureCount(seed.length)
+    setProcessedRows(0)
+    setSelectedIds([])
+    setSelectedProperties(null)
+    setStatus(seed.length
+      ? `Showing ${seed.length.toLocaleString()} table-page features while freezing the full result…`
+      : 'Freezing filtered result…')
+    setMapFeatures(map, seed)
+
+    const bounds = emptyBounds()
+    for (const feature of seed) extendBoundsWithGeometry(bounds, feature.geometry)
+    if (seed.length > 0) fitSnapshotBounds(map, bounds)
+    // Recompute the final bounds from the authoritative full snapshot stream.
+    const fullBounds = emptyBounds()
+
+    let lastPaintedRows = 0
+    void loadSnapshotFeatures(
+      dataset,
+      source,
+      snapshot,
+      thisRequest,
+      requestId,
+      fullBounds,
+      (features, rowsRead) => {
+        if (thisRequest !== requestId.current) return
+        setFeatureCount(features.length)
+        setProcessedRows(rowsRead)
+        setStatus(
+          `Freezing… ${rowsRead.toLocaleString()} / ${snapshot.expectedRows.toLocaleString()} matching rows`,
+        )
+
+        // Painting the complete, ever-growing GeoJSON source after every small
+        // Arrow batch becomes quadratic on very large snapshots. Paint the first
+        // batch immediately, then in larger increments; the final snapshot is
+        // always painted once in full below.
+        if (lastPaintedRows === 0 || rowsRead - lastPaintedRows >= 50_000) {
+          featuresRef.current = features.slice()
+          setMapFeatures(map, features)
+          lastPaintedRows = rowsRead
+        }
+      },
+    ).then(({ features, rowsRead }) => {
+      if (thisRequest !== requestId.current) return
+      featuresRef.current = features
+      setMapFeatures(map, features)
+      setFeatureCount(features.length)
+      setProcessedRows(rowsRead)
+      setStatus('Frozen snapshot · pan and zoom do not re-query Parquet')
+      fitSnapshotBounds(map, fullBounds)
+    }).catch(error => {
+      if (thisRequest === requestId.current) setStatus(String(error))
+    })
+  }, [dataset.dataset_id, source, snapshot.id])
+
+  function changeProjection(next: ProjectionMode) {
+    if (next === projectionRef.current) return
+    projectionRef.current = next
+    setProjection(next)
+    mapRef.current?.setProjection({ type: next })
+  }
+
+  function changeBasemap(next: BasemapId) {
+    if (next === basemapRef.current) return
+    basemapAutomatic.current = false
+    basemapRef.current = next
+    setBasemap(next)
+    mapRef.current?.setStyle(BASEMAPS[next].style)
+  }
+
+  function clearSelection() {
+    setSelectedIds([])
+    setSelectedProperties(null)
+  }
+
   return (
     <div className="map-shell">
       <div className="map-toolbar">
-        <span>
+        <span className="map-source-label">
           {source.kind === 'coordinates' ? (
             <>
               <strong>{source.longitude}</strong>
@@ -203,240 +321,233 @@ export function MapPanel({
               {source.geometry.logical_type}
             </>
           )}
+          {' · '}
+          <strong>{snapshot.expectedRows.toLocaleString()}</strong> frozen rows
         </span>
-        <span>{featureCount.toLocaleString()} features · {status}</span>
+
+        <div className="map-toolbar-controls">
+          <button
+            type="button"
+            className={`secondary compact${boxSelect ? ' active-tool' : ''}`}
+            aria-pressed={boxSelect}
+            onClick={() => setBoxSelect(current => !current)}
+          >
+            Box select
+          </button>
+          {selectedIds.length > 0 && (
+            <button type="button" className="secondary compact" onClick={clearSelection}>
+              Clear {selectedIds.length.toLocaleString()} selected
+            </button>
+          )}
+
+          <label className="map-basemap-select">
+            <span>Basemap</span>
+            <select
+              value={basemap}
+              aria-label="Basemap"
+              onChange={event => changeBasemap(event.target.value as BasemapId)}
+            >
+              {Object.entries(BASEMAPS).map(([id, option]) => (
+                <option key={id} value={id}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+
+          <div className="segmented-control" role="group" aria-label="Map projection">
+            <button
+              type="button"
+              className={projection === 'mercator' ? 'active' : ''}
+              aria-pressed={projection === 'mercator'}
+              onClick={() => changeProjection('mercator')}
+            >
+              Map
+            </button>
+            <button
+              type="button"
+              className={projection === 'globe' ? 'active' : ''}
+              aria-pressed={projection === 'globe'}
+              onClick={() => changeProjection('globe')}
+            >
+              Globe
+            </button>
+          </div>
+        </div>
       </div>
 
-      <div ref={container} className="map-canvas" />
+      <div className="map-stage">
+        <div ref={container} className="map-canvas" />
+        {selectionBox && (
+          <div
+            className="map-selection-box"
+            style={selectionBox}
+            aria-hidden="true"
+          />
+        )}
+        <div className="map-status-card">
+          {featureCount.toLocaleString()} features · {processedRows.toLocaleString()} rows read · {status}
+        </div>
+
+        {selectedIds.length > 0 && (
+          <div className="map-selection-card">
+            <div className="map-selection-card-head">
+              <strong>{selectedIds.length.toLocaleString()} selected</strong>
+              <button type="button" className="icon-button" aria-label="Clear selection" onClick={clearSelection}>×</button>
+            </div>
+            {selectedProperties && (
+              <dl>
+                {Object.entries(selectedProperties).slice(0, 10).map(([key, value]) => (
+                  <div key={key}>
+                    <dt>{key}</dt>
+                    <dd title={displayValue(value)}>{displayValue(value)}</dd>
+                  </div>
+                ))}
+              </dl>
+            )}
+          </div>
+        )}
+      </div>
 
       <div className="map-note">
-        Coordinate datasets are filtered in native Rust and rendered without WKB decoding.
-        Geometry datasets use the existing bounded WKB fallback until the direct GeoArrow/deck.gl path is added.
+        This map is a frozen snapshot of the filter state captured from the Data tab. Click any rendered geometry to inspect it, or enable Box select and drag over points, lines, polygons, or multipart features.
       </div>
     </div>
   )
 }
 
-async function loadCoordinateFeatures(
-  dataset: DatasetInfo,
-  source: CoordinateSpatialSource,
-  map: MapLibreMap,
-  baseFilters: FilterClause[],
-  thisRequest: number,
-  requestId: { current: number },
-  onProgress: (features: Feature[]) => void,
-): Promise<Feature[]> {
-  const propertyColumns = selectPropertyColumns(
-    dataset,
-    new Set([source.longitude, source.latitude]),
-  )
-  const columns = [source.longitude, source.latitude, ...propertyColumns]
-  const filterSets = coordinateViewportFilterSets(
-    map.getBounds(),
-    source,
-    baseFilters,
-  )
-
-  const features: Feature[] = []
-  const perRequestLimit = Math.max(
-    1,
-    Math.ceil(MAP_FEATURE_LIMIT / filterSets.length),
-  )
-
-  for (const viewportFilters of filterSets) {
-    if (thisRequest !== requestId.current) break
-
-    for await (
-      const batch of pageBatches(dataset.dataset_id, {
-        columns,
-        offset: 0,
-        limit: perRequestLimit,
-        filters: viewportFilters,
-      })
-    ) {
-      if (thisRequest !== requestId.current) break
-
-      const longitude = batch.getChild(source.longitude)
-      const latitude = batch.getChild(source.latitude)
-      if (!longitude || !latitude) continue
-
-      for (let row = 0; row < batch.numRows; row += 1) {
-        const x = longitude.get(row)
-        const y = latitude.get(row)
-
-        if (
-          typeof x !== 'number'
-          || typeof y !== 'number'
-          || !Number.isFinite(x)
-          || !Number.isFinite(y)
-        ) {
-          continue
-        }
-
-        const properties: Record<string, unknown> = {}
-        for (const name of propertyColumns) {
-          properties[name] = plainValue(batch.getChild(name)?.get(row))
-        }
-
-        features.push({
-          type: 'Feature',
-          geometry: {
-            type: 'Point',
-            coordinates: [x, y],
-          },
-          properties,
-        })
-
-        if (features.length >= MAP_FEATURE_LIMIT) break
-      }
-
-      // Show pixels after each Arrow RecordBatch instead of waiting for the
-      // whole request to finish.
-      onProgress(features)
-
-      if (features.length >= MAP_FEATURE_LIMIT) break
-    }
-
-    if (features.length >= MAP_FEATURE_LIMIT) break
+function ensureParquetLayers(map: MapLibreMap) {
+  if (!map.getSource(SOURCE_ID)) {
+    map.addSource(SOURCE_ID, {
+      type: 'geojson',
+      data: EMPTY,
+    })
   }
 
-  return features
+  if (!map.getLayer('pv-polygons')) {
+    map.addLayer({
+      id: 'pv-polygons',
+      type: 'fill',
+      source: SOURCE_ID,
+      filter: ['in', ['geometry-type'], ['literal', ['Polygon', 'MultiPolygon']]],
+      paint: {
+        'fill-color': '#2684ff',
+        'fill-opacity': 0.34,
+      },
+    })
+  }
+
+  if (!map.getLayer('pv-lines')) {
+    map.addLayer({
+      id: 'pv-lines',
+      type: 'line',
+      source: SOURCE_ID,
+      filter: ['in', ['geometry-type'], ['literal', ['LineString', 'MultiLineString']]],
+      paint: {
+        'line-color': '#168cff',
+        'line-width': 1.7,
+        'line-opacity': 0.88,
+      },
+    })
+  }
+
+  if (!map.getLayer('pv-points')) {
+    map.addLayer({
+      id: 'pv-points',
+      type: 'circle',
+      source: SOURCE_ID,
+      filter: ['in', ['geometry-type'], ['literal', ['Point', 'MultiPoint']]],
+      paint: {
+        'circle-color': '#168cff',
+        'circle-radius': 3.4,
+        'circle-stroke-color': '#ffffff',
+        'circle-stroke-width': 0.7,
+        'circle-opacity': 0.84,
+      },
+    })
+  }
+
+  if (!map.getLayer('pv-polygons-selected')) {
+    map.addLayer({
+      id: 'pv-polygons-selected',
+      type: 'fill',
+      source: SOURCE_ID,
+      filter: emptySelectionFilter(),
+      paint: {
+        'fill-color': '#ffb020',
+        'fill-opacity': 0.52,
+        'fill-outline-color': '#fff2c7',
+      },
+    })
+  }
+
+  if (!map.getLayer('pv-lines-selected')) {
+    map.addLayer({
+      id: 'pv-lines-selected',
+      type: 'line',
+      source: SOURCE_ID,
+      filter: emptySelectionFilter(),
+      paint: {
+        'line-color': '#ffb020',
+        'line-width': 4,
+        'line-opacity': 1,
+      },
+    })
+  }
+
+  if (!map.getLayer('pv-points-selected')) {
+    map.addLayer({
+      id: 'pv-points-selected',
+      type: 'circle',
+      source: SOURCE_ID,
+      filter: emptySelectionFilter(),
+      paint: {
+        'circle-color': '#ffb020',
+        'circle-radius': 6,
+        'circle-stroke-color': '#ffffff',
+        'circle-stroke-width': 1.5,
+        'circle-opacity': 1,
+      },
+    })
+  }
 }
 
-async function loadGeometryFeatures(
+async function loadSnapshotFeatures(
   dataset: DatasetInfo,
-  source: GeometrySpatialSource,
-  map: MapLibreMap,
-  filters: FilterClause[],
+  source: SpatialSource,
+  snapshot: MapSnapshotSpec,
   thisRequest: number,
   requestId: { current: number },
-  onProgress: (features: Feature[]) => void,
-): Promise<Feature[]> {
-  const geo = source.geometry
-  const bbox = mapBoundsTuple(map)
-  const propertyColumns = selectPropertyColumns(dataset, new Set([geo.name]))
-  const columns = [geo.name, ...propertyColumns]
+  bounds: BoundsAccumulator,
+  onProgress: (features: Feature[], processedRows: number) => void,
+): Promise<{ features: Feature[]; rowsRead: number }> {
+  const propertyColumns = selectMapPropertyColumns(dataset, source)
+  const columns = [...spatialColumnNames(source), ...propertyColumns]
+
   const features: Feature[] = []
+  let rowsRead = 0
 
   for await (
-    const batch of spatialBatches(dataset.dataset_id, {
-      bbox,
-      geometry_column: geo.name,
+    const batch of snapshotBatches(dataset.dataset_id, {
       columns,
-      max_features: MAP_FEATURE_LIMIT,
-      filters,
+      filters: snapshot.filters,
     })
   ) {
     if (thisRequest !== requestId.current) break
 
-    const geometryVector = batch.getChild(geo.name)
-    if (!geometryVector) continue
-
-    for (let row = 0; row < batch.numRows; row += 1) {
-      const bytes = geometryVector.get(row)
-      if (!(bytes instanceof Uint8Array)) continue
-
-      const parsed = parseWkb(bytes)
-      if (!parsed) continue
-
-      const properties: Record<string, unknown> = {}
-      for (const name of propertyColumns) {
-        properties[name] = plainValue(batch.getChild(name)?.get(row))
-      }
-
-      features.push({
-        type: 'Feature',
-        geometry: parsed as Geometry,
-        properties,
-      })
-
-      if (features.length >= MAP_FEATURE_LIMIT) break
+    const before = features.length
+    appendSpatialBatchFeatures(batch, source, propertyColumns, features, rowsRead)
+    for (let index = before; index < features.length; index += 1) {
+      extendBoundsWithGeometry(bounds, features[index].geometry)
     }
 
-    onProgress(features)
-    if (features.length >= MAP_FEATURE_LIMIT) break
+    rowsRead += batch.numRows
+    onProgress(features, rowsRead)
   }
 
-  return features
+  return { features, rowsRead }
 }
 
-function coordinateViewportFilterSets(
-  bounds: LngLatBounds,
-  source: CoordinateSpatialSource,
-  baseFilters: FilterClause[],
-): FilterClause[][] {
-  const south = clamp(bounds.getSouth(), -90, 90)
-  const north = clamp(bounds.getNorth(), -90, 90)
-  const rawWest = bounds.getWest()
-  const rawEast = bounds.getEast()
-
-  const latitudeFilters: FilterClause[] = [
-    ...baseFilters,
-    { column: source.latitude, op: 'gte', value: south },
-    { column: source.latitude, op: 'lte', value: north },
-  ]
-
-  // At the whole-world view, filtering longitude adds no selectivity and can
-  // complicate antimeridian handling.
-  if (rawEast - rawWest >= 359.999) {
-    return [latitudeFilters]
-  }
-
-  const west = normalizeLongitude(rawWest)
-  const east = normalizeLongitude(rawEast)
-
-  if (west <= east) {
-    return [[
-      ...latitudeFilters,
-      { column: source.longitude, op: 'gte', value: west },
-      { column: source.longitude, op: 'lte', value: east },
-    ]]
-  }
-
-  // Viewport crosses the antimeridian. The current backend filter language is
-  // AND-only, so issue two small exact requests and merge the results.
-  return [
-    [
-      ...latitudeFilters,
-      { column: source.longitude, op: 'gte', value: west },
-      { column: source.longitude, op: 'lte', value: 180 },
-    ],
-    [
-      ...latitudeFilters,
-      { column: source.longitude, op: 'gte', value: -180 },
-      { column: source.longitude, op: 'lte', value: east },
-    ],
-  ]
-}
-
-function selectPropertyColumns(
-  dataset: DatasetInfo,
-  excluded: Set<string>,
-): string[] {
-  const preferredNames = [
-    'id',
-    'scientificName',
-    'acceptedScientificName',
-    'species',
-    'occurrenceID',
-    'name',
-    'title',
-  ]
-
-  const available = new Set(dataset.columns.map(column => column.name))
-  const selected = preferredNames.filter(
-    name => available.has(name) && !excluded.has(name),
-  )
-
-  if (selected.length >= 4) return selected.slice(0, 4)
-
-  for (const column of dataset.columns) {
-    if (excluded.has(column.name) || selected.includes(column.name)) continue
-    selected.push(column.name)
-    if (selected.length >= 4) break
-  }
-
-  return selected
+function availableFeatureLayers(map: MapLibreMap): string[] {
+  return FEATURE_LAYER_IDS.filter(layer => map.getLayer(layer))
 }
 
 function setMapFeatures(map: MapLibreMap, features: Feature[]) {
@@ -449,39 +560,101 @@ function setMapFeatures(map: MapLibreMap, features: Feature[]) {
   })
 }
 
-function mapBoundsTuple(
-  map: MapLibreMap,
-): [number, number, number, number] {
-  const bounds = map.getBounds()
-  return [
-    bounds.getWest(),
-    bounds.getSouth(),
-    bounds.getEast(),
-    bounds.getNorth(),
-  ]
+function setSelectionFilter(map: MapLibreMap, ids: FeatureId[]) {
+  const filter = ids.length
+    ? ['in', ['id'], ['literal', ids]]
+    : emptySelectionFilter()
+
+  for (const layer of SELECTED_LAYER_IDS) {
+    if (map.getLayer(layer)) map.setFilter(layer, filter as never)
+  }
 }
 
-function fitGeometryDataset(
-  map: MapLibreMap,
-  source: GeometrySpatialSource,
-) {
-  const bbox = source.geometry.dataset_bbox
-  if (!bbox || bbox.length < 4) return
+function emptySelectionFilter() {
+  return ['in', ['id'], ['literal', []]] as never
+}
 
+function uniqueFeatureIds(features: MapGeoJSONFeature[]): FeatureId[] {
+  const seen = new Set<FeatureId>()
+  for (const feature of features) {
+    if (feature.id != null) seen.add(feature.id)
+  }
+  return [...seen]
+}
+
+function featureProperties(feature?: MapGeoJSONFeature): Record<string, unknown> | null {
+  if (!feature) return null
+  return { ...feature.properties }
+}
+
+function rectangleFromPoints(
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+): SelectionBox {
+  return {
+    left: Math.min(start.x, end.x),
+    top: Math.min(start.y, end.y),
+    width: Math.abs(end.x - start.x),
+    height: Math.abs(end.y - start.y),
+  }
+}
+
+function emptyBounds(): BoundsAccumulator {
+  return {
+    west: Number.POSITIVE_INFINITY,
+    south: Number.POSITIVE_INFINITY,
+    east: Number.NEGATIVE_INFINITY,
+    north: Number.NEGATIVE_INFINITY,
+    valid: false,
+  }
+}
+
+function extendBoundsWithGeometry(bounds: BoundsAccumulator, geometry: Geometry) {
+  if (geometry.type === 'GeometryCollection') {
+    for (const child of geometry.geometries) extendBoundsWithGeometry(bounds, child)
+    return
+  }
+  visitPositions(geometry.coordinates, position => {
+    const x = position[0]
+    const y = position[1]
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return
+    bounds.west = Math.min(bounds.west, x)
+    bounds.south = Math.min(bounds.south, y)
+    bounds.east = Math.max(bounds.east, x)
+    bounds.north = Math.max(bounds.north, y)
+    bounds.valid = true
+  })
+}
+
+function visitPositions(value: Position | Position[] | Position[][] | Position[][][], visit: (position: Position) => void) {
+  if (!Array.isArray(value) || value.length === 0) return
+  if (typeof value[0] === 'number') {
+    visit(value as Position)
+    return
+  }
+  for (const child of value as Position[][][]) visitPositions(child, visit)
+}
+
+function fitSnapshotBounds(map: MapLibreMap, bounds: BoundsAccumulator) {
+  if (!bounds.valid) return
+  const width = bounds.east - bounds.west
+  if (width >= 350) {
+    map.jumpTo({ center: [0, (bounds.south + bounds.north) / 2], zoom: 1.2 })
+    return
+  }
   map.fitBounds(
-    [[bbox[0], bbox[1]], [bbox[2], bbox[3]]],
-    {
-      padding: 40,
-      duration: 0,
-      maxZoom: 7,
-    },
+    [[bounds.west, bounds.south], [bounds.east, bounds.north]],
+    { padding: 48, duration: 0, maxZoom: 12 },
   )
 }
 
-function normalizeLongitude(value: number): number {
-  return ((value + 180) % 360 + 360) % 360 - 180
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value))
+function displayValue(value: unknown): string {
+  if (value == null) return '—'
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
 }

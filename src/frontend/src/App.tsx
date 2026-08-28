@@ -1,14 +1,17 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { RecordBatch } from 'apache-arrow'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { Feature } from 'geojson'
 import { batchRows, type PlainRow } from './arrow'
-import { closeDataset, downloadSubset, openDataset, pageBatches } from './api'
+import { closeDataset, countRows, downloadSubset, openDataset, pageBatches } from './api'
+import { ColumnPicker } from './ColumnPicker'
 import { DataTable } from './DataTable'
 import { FilterBar } from './FilterBar'
 import { MapPanel } from './MapPanel'
 import { detectSpatialSource } from './spatial'
-import type { DatasetInfo, FilterClause } from './types'
+import { appendSpatialBatchFeatures, spatialColumnNames } from './spatialFeatures'
+import type { DatasetInfo, FilterClause, MapSnapshotSpec } from './types'
 
 type Tab = 'data' | 'map' | 'schema'
+type Theme = 'light' | 'dark'
 
 export default function App() {
   const [uri, setUri] = useState('')
@@ -17,10 +20,18 @@ export default function App() {
   const [offset, setOffset] = useState(0)
   const [limit, setLimit] = useState(1000)
   const [rows, setRows] = useState<PlainRow[]>([])
-  const [columns, setColumns] = useState<string[]>([])
+  const [visibleColumns, setVisibleColumns] = useState<string[]>([])
   const [filters, setFilters] = useState<FilterClause[]>([])
+  const [totalRows, setTotalRows] = useState<number | null>(null)
+  const [countLoading, setCountLoading] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [theme, setTheme] = useState<Theme>(getInitialTheme)
+  const [mapSnapshot, setMapSnapshot] = useState<MapSnapshotSpec | null>(null)
+  const [mapPageFeatures, setMapPageFeatures] = useState<Feature[]>([])
+  const [mapSnapshotSeed, setMapSnapshotSeed] = useState<Feature[]>([])
+  const pageRequestId = useRef(0)
+  const mapSnapshotId = useRef(0)
 
   const spatialSource = useMemo(
     () => dataset ? detectSpatialSource(dataset) : undefined,
@@ -28,9 +39,34 @@ export default function App() {
   )
 
   useEffect(() => {
+    document.documentElement.dataset.theme = theme
+    window.localStorage.setItem('parquet-viewer-theme', theme)
+  }, [theme])
+
+  useEffect(() => {
     if (!dataset) return
-    void loadPage(dataset, offset, limit)
-  }, [dataset?.dataset_id, offset, limit, filters])
+    void loadPage(dataset, offset, limit, visibleColumns)
+  }, [dataset?.dataset_id, offset, limit, filters, visibleColumns])
+
+  useEffect(() => {
+    if (!dataset) return
+    if (filters.length === 0) {
+      setTotalRows(dataset.num_rows)
+      setCountLoading(false)
+      return
+    }
+
+    let cancelled = false
+    setCountLoading(true)
+    setTotalRows(null)
+
+    void countRows(dataset.dataset_id, filters)
+      .then(count => { if (!cancelled) setTotalRows(count) })
+      .catch(err => { if (!cancelled) setError(String(err)) })
+      .finally(() => { if (!cancelled) setCountLoading(false) })
+
+    return () => { cancelled = true }
+  }, [dataset?.dataset_id, filters])
 
   async function onOpen(event: React.FormEvent) {
     event.preventDefault()
@@ -49,7 +85,13 @@ export default function App() {
       setDataset(info)
       setOffset(0)
       setFilters([])
-      setTab(detectSpatialSource(info) ? 'map' : 'data')
+      setRows([])
+      setVisibleColumns(info.columns.map(column => column.name))
+      setTotalRows(info.num_rows)
+      setMapSnapshot(null)
+      setMapPageFeatures([])
+      setMapSnapshotSeed([])
+      setTab('data')
     } catch (err) {
       setError(String(err))
     } finally {
@@ -61,50 +103,110 @@ export default function App() {
     info: DatasetInfo,
     pageOffset: number,
     pageLimit: number,
+    pageColumns: string[],
   ) {
+    const requestId = ++pageRequestId.current
+
+    const pageSpatialSource = detectSpatialSource(info)
+    // Numeric coordinate pairs are cheap enough to keep with the table page so
+    // Switch to map can paint those rows immediately. Large WKB geometry stays
+    // out of the table projection unless the user already chose to display it.
+    const requiredSpatialColumns = pageSpatialSource?.kind === 'coordinates'
+      ? spatialColumnNames(pageSpatialSource)
+      : pageSpatialSource && pageColumns.includes(pageSpatialSource.geometry.name)
+        ? [pageSpatialSource.geometry.name]
+        : []
+    const requestColumns = [...new Set([...pageColumns, ...requiredSpatialColumns])]
+
+    if (requestColumns.length === 0) {
+      setRows([])
+      setMapPageFeatures([])
+      setLoading(false)
+      return
+    }
+
     setLoading(true)
     setError('')
 
     try {
       const nextRows: PlainRow[] = []
-      let firstBatch: RecordBatch | null = null
+      const nextMapFeatures: Feature[] = []
+      let rowsRead = 0
+      const spatialSet = new Set(requiredSpatialColumns)
+      const mapPropertyColumns = pageColumns.filter(name => !spatialSet.has(name)).slice(0, 8)
 
       for await (
         const batch of pageBatches(info.dataset_id, {
+          columns: requestColumns,
           offset: pageOffset,
           limit: pageLimit,
           filters,
         })
       ) {
-        firstBatch ??= batch
         nextRows.push(...batchRows(batch, pageLimit - nextRows.length))
+        if (pageSpatialSource) {
+          appendSpatialBatchFeatures(
+            batch,
+            pageSpatialSource,
+            mapPropertyColumns,
+            nextMapFeatures,
+            pageOffset + rowsRead,
+          )
+        }
+        rowsRead += batch.numRows
         if (nextRows.length >= pageLimit) break
       }
 
-      setRows(nextRows)
-      setColumns(
-        firstBatch?.schema.fields.map(field => field.name)
-        ?? info.columns.map(column => column.name),
-      )
+      if (requestId === pageRequestId.current) {
+        setRows(nextRows)
+        setMapPageFeatures(nextMapFeatures)
+      }
     } catch (err) {
-      setError(String(err))
+      if (requestId === pageRequestId.current) {
+        setMapPageFeatures([])
+        setError(String(err))
+      }
     } finally {
-      setLoading(false)
+      if (requestId === pageRequestId.current) setLoading(false)
     }
+  }
+
+  function switchToMap() {
+    if (!dataset || !spatialSource || totalRows == null || countLoading) return
+
+    setMapSnapshotSeed(mapPageFeatures.slice())
+    setMapSnapshot({
+      id: ++mapSnapshotId.current,
+      filters: filters.map(filter => ({ ...filter })),
+      expectedRows: totalRows,
+    })
+    setTab('map')
   }
 
   return (
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <h1>Parquet Globe</h1>
-          <p>Native Rust Parquet explorer · Arrow IPC · table + spatial viewport queries</p>
+          <h1>Parquet Viewer</h1>
+          <p>Native Rust Parquet explorer · Arrow IPC · table + spatial map queries</p>
         </div>
-        {dataset && (
-          <div className="dataset-pill">
-            {dataset.num_rows.toLocaleString()} rows · {dataset.num_row_groups} row groups
-          </div>
-        )}
+        <div className="topbar-actions">
+          {dataset && (
+            <div className="dataset-pill">
+              {dataset.num_rows.toLocaleString()} rows · {dataset.num_row_groups} row groups
+            </div>
+          )}
+          <button
+            type="button"
+            className="theme-toggle secondary"
+            aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            aria-pressed={theme === 'dark'}
+            onClick={() => setTheme(current => current === 'dark' ? 'light' : 'dark')}
+          >
+            <span aria-hidden="true">{theme === 'dark' ? '☾' : '☀'}</span>
+            {theme === 'dark' ? 'Dark' : 'Light'}
+          </button>
+        </div>
       </header>
 
       <form className="open-bar" onSubmit={onOpen}>
@@ -128,7 +230,7 @@ export default function App() {
             <h2>Paste a Parquet URL.</h2>
             <p>
               The Rust backend range-reads Parquet. Table data arrives as Arrow IPC;
-              coordinate pairs and geometry columns can be explored on the globe.
+              coordinate pairs and geometry columns can be explored on an interactive map or globe.
             </p>
           </div>
         </main>
@@ -213,10 +315,10 @@ export default function App() {
               </TabButton>
               <TabButton
                 active={tab === 'map'}
-                disabled={!spatialSource}
+                disabled={!spatialSource || !mapSnapshot}
                 onClick={() => setTab('map')}
               >
-                Globe
+                Map
               </TabButton>
               <TabButton active={tab === 'schema'} onClick={() => setTab('schema')}>
                 Schema
@@ -239,57 +341,91 @@ export default function App() {
                   <div className="pager">
                     <button
                       className="secondary"
-                      disabled={offset === 0 || loading}
+                      disabled={offset === 0 || loading || visibleColumns.length === 0}
                       onClick={() => setOffset(Math.max(0, offset - limit))}
                     >
                       Previous
                     </button>
                     <span>
-                      {rows.length
-                        ? `${(offset + 1).toLocaleString()}–${(offset + rows.length).toLocaleString()}`
-                        : '0 rows'}
-                      {filters.length ? ' matching' : ''}
+                      {visibleColumns.length === 0
+                        ? `No columns selected · ${countLoading || totalRows == null ? 'counting…' : totalRows.toLocaleString()}${filters.length ? ' matching' : ' rows'}`
+                        : `${rows.length ? `${(offset + 1).toLocaleString()}–${(offset + rows.length).toLocaleString()}` : '0 rows'} of ${countLoading || totalRows == null ? 'counting…' : totalRows.toLocaleString()}${filters.length ? ' matching' : ''}`}
                     </span>
                     <button
                       className="secondary"
-                      disabled={loading || (
-                        filters.length
-                          ? rows.length < limit
-                          : offset + rows.length >= dataset.num_rows
-                      )}
+                      disabled={
+                        loading
+                        || countLoading
+                        || visibleColumns.length === 0
+                        || totalRows == null
+                        || offset + rows.length >= totalRows
+                      }
                       onClick={() => setOffset(offset + limit)}
                     >
                       Next
                     </button>
                   </div>
 
-                  <label>
-                    Rows{' '}
-                    <select
-                      value={limit}
-                      onChange={event => {
+                  <div className="table-controls">
+                    {spatialSource && (
+                      <button
+                        type="button"
+                        className="map-switch-button"
+                        disabled={loading || countLoading || totalRows == null}
+                        onClick={switchToMap}
+                        title="Freeze the current filtered result and render the complete spatial selection on the map"
+                      >
+                        {countLoading
+                          ? 'Counting…'
+                          : mapSnapshot && sameFilters(mapSnapshot.filters, filters)
+                            ? 'Refresh map snapshot'
+                            : 'Switch to map'}
+                      </button>
+                    )}
+                    <ColumnPicker
+                      columns={dataset.columns}
+                      visibleColumns={visibleColumns}
+                      disabled={loading}
+                      onChange={next => {
                         setOffset(0)
-                        setLimit(Number(event.target.value))
+                        setVisibleColumns(next)
                       }}
-                    >
-                      <option>250</option>
-                      <option>1000</option>
-                      <option>5000</option>
-                      <option>10000</option>
-                    </select>
-                  </label>
+                    />
+                    <label>
+                      Rows/page{' '}
+                      <select
+                        value={limit}
+                        disabled={loading}
+                        onChange={event => {
+                          setOffset(0)
+                          setLimit(Number(event.target.value))
+                        }}
+                      >
+                        <option>250</option>
+                        <option>1000</option>
+                        <option>5000</option>
+                        <option>10000</option>
+                      </select>
+                    </label>
+                  </div>
                 </div>
 
-                <DataTable columns={columns} rows={rows} />
+                <DataTable columns={visibleColumns} rows={rows} />
               </section>
             )}
 
-            {tab === 'map' && spatialSource && (
-              <section className="pane map-pane">
+            {spatialSource && mapSnapshot && (
+              <section
+                className={`pane map-pane${tab === 'map' ? '' : ' pane-hidden'}`}
+                aria-hidden={tab !== 'map'}
+              >
                 <MapPanel
                   dataset={dataset}
                   source={spatialSource}
-                  filters={filters}
+                  snapshot={mapSnapshot}
+                  seedFeatures={mapSnapshotSeed}
+                  theme={theme}
+                  active={tab === 'map'}
                 />
               </section>
             )}
@@ -384,6 +520,16 @@ function Metric({ label, value }: { label: string; value: string }) {
       <span className="metric-label">{label}</span>
     </div>
   )
+}
+
+function getInitialTheme(): Theme {
+  const saved = window.localStorage.getItem('parquet-viewer-theme')
+  if (saved === 'light' || saved === 'dark') return saved
+  return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+}
+
+function sameFilters(left: FilterClause[], right: FilterClause[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 function filename(uri: string) {

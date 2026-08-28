@@ -133,6 +133,25 @@ pub struct PageRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotRequest {
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
+    #[serde(default)]
+    pub filters: Vec<FilterClause>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CountRequest {
+    #[serde(default)]
+    pub filters: Vec<FilterClause>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CountResponse {
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SpatialRequest {
     pub bbox: [f64; 4],
     #[serde(default)]

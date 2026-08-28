@@ -20,8 +20,8 @@ use tempfile::{NamedTempFile, TempPath};
 use uuid::Uuid;
 
 use crate::model::{
-    Capabilities, ColumnInfo, DatasetEntry, DatasetInfo, ExportFormat, ExportRequest,
-    GeoColumnInfo, GeoParquetInfo, PageRequest, SpatialRequest,
+    Capabilities, ColumnInfo, CountRequest, DatasetEntry, DatasetInfo, ExportFormat, ExportRequest,
+    GeoColumnInfo, GeoParquetInfo, PageRequest, SnapshotRequest, SpatialRequest,
 };
 use filter::apply_filters;
 use ipc::{IpcByteStream, spawn_ipc_stream};
@@ -80,6 +80,58 @@ impl CoreEngine {
             bail!("dataset not found: {dataset_id}");
         }
         Ok(())
+    }
+
+    pub async fn snapshot_stream(
+        &self,
+        dataset_id: &str,
+        req: SnapshotRequest,
+    ) -> Result<IpcByteStream> {
+        let entry = self.entry(dataset_id)?;
+        let builder = builder_for_uri(&entry.info.uri).await?;
+        let builder = apply_filters(builder, &req.filters)?;
+        let builder = apply_projection(builder, req.columns.as_deref())?
+            .with_batch_size(self.batch_size);
+        let stream = builder
+            .build()
+            .context("could not build filtered snapshot reader")?;
+        let schema = Arc::clone(stream.schema());
+        Ok(spawn_ipc_stream(stream, schema, self.ipc_channel_capacity))
+    }
+
+    pub async fn count_rows(&self, dataset_id: &str, req: CountRequest) -> Result<u64> {
+        let entry = self.entry(dataset_id)?;
+        if req.filters.is_empty() {
+            return u64::try_from(entry.info.num_rows)
+                .context("dataset row count cannot be represented as u64");
+        }
+
+        let builder = builder_for_uri(&entry.info.uri).await?;
+        let builder = apply_filters(builder, &req.filters)?;
+
+        // Counting still has to evaluate every matching row, but project the
+        // output down to a single column so we do not materialize the entire
+        // table merely to determine the exact filtered result count. Filter
+        // columns are loaded independently by Parquet's RowFilter.
+        let count_projection = entry
+            .info
+            .columns
+            .first()
+            .map(|column| vec![column.name.clone()]);
+        let builder = apply_projection(builder, count_projection.as_deref())?
+            .with_batch_size(self.batch_size);
+        let mut stream = builder
+            .build()
+            .context("could not build filtered count reader")?;
+
+        use futures::TryStreamExt;
+        let mut total = 0u64;
+        while let Some(batch) = stream.try_next().await.context("filtered count read failed")? {
+            total = total
+                .checked_add(batch.num_rows() as u64)
+                .ok_or_else(|| anyhow!("filtered row count overflow"))?;
+        }
+        Ok(total)
     }
 
     pub async fn page_stream(&self, dataset_id: &str, req: PageRequest) -> Result<IpcByteStream> {
