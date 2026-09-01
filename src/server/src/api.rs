@@ -1,13 +1,12 @@
 use std::{io, sync::Arc};
 
 use axum::{
-    Json,
+    Json, Router,
     body::Body,
     extract::{Path, State},
     http::{HeaderValue, StatusCode, header},
     response::Response,
     routing::{delete, get, post},
-    Router,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -17,8 +16,8 @@ use crate::{
     AppState,
     error::ApiError,
     model::{
-        CountRequest, CountResponse, DatasetInfo, DatasetOpenRequest, ExportRequest, HealthResponse,
-        PageRequest, SchemaResponse, SnapshotRequest, SpatialRequest,
+        CountRequest, CountResponse, DatasetInfo, DatasetOpenRequest, ExportRequest,
+        HealthResponse, PageRequest, SchemaResponse, SnapshotRequest, SpatialRequest,
     },
     security::validate_source_uri,
 };
@@ -98,7 +97,7 @@ async fn schema(
 async fn page(
     State(state): State<Arc<AppState>>,
     Path(dataset_id): Path<String>,
-    Json(mut payload): Json<PageRequest>,
+    Json(payload): Json<PageRequest>,
 ) -> Result<Response, ApiError> {
     if !payload.sort.is_empty() {
         return Err(ApiError::not_implemented(
@@ -204,16 +203,14 @@ async fn export(
     // Hold TempPath inside the stream state. It deletes the temporary export as
     // soon as the HTTP body reaches EOF or is dropped after a disconnect.
     let reader = ReaderStream::new(file);
-    let guarded_stream = stream::unfold(
-        (reader, artifact.path),
-        |(mut reader, guard)| async move {
+    let guarded_stream =
+        stream::unfold((reader, artifact.path), |(mut reader, guard)| async move {
             match reader.next().await {
                 Some(Ok(bytes)) => Some((Ok::<Bytes, io::Error>(bytes), (reader, guard))),
                 Some(Err(error)) => Some((Err(error), (reader, guard))),
                 None => None,
             }
-        },
-    );
+        });
 
     let mut response = Response::new(Body::from_stream(guarded_stream));
     *response.status_mut() = StatusCode::OK;
@@ -273,4 +270,3 @@ where
     }
     response
 }
-

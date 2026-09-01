@@ -188,7 +188,6 @@ export default function App() {
       <header className="topbar">
         <div>
           <h1>Parquet Viewer</h1>
-          <p>Native Rust Parquet explorer · Arrow IPC · table + spatial map queries</p>
         </div>
         <div className="topbar-actions">
           {dataset && (
