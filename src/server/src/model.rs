@@ -4,6 +4,8 @@
 //! engine and HTTP concerns belong in `api.rs`. Keeping the wire contract here
 //! makes endpoint behavior easier to review and document.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 
 /// Request to validate and register a Parquet source URL for this browser session.
@@ -97,9 +99,19 @@ impl Default for Capabilities {
     }
 }
 
+/// Process-local handle metadata for one opened dataset.
+///
+/// `DatasetEntry` does **not** contain Parquet row data. It only keeps the
+/// lightweight `DatasetInfo` plus monotonic timestamps used to expire abandoned
+/// browser handles. The engine refreshes `last_accessed_at` whenever an operation
+/// successfully resolves this handle.
 #[derive(Debug, Clone)]
 pub struct DatasetEntry {
     pub info: DatasetInfo,
+    /// When this process first registered the handle. Used for lifecycle logs.
+    pub opened_at: Instant,
+    /// Most recent successful engine lookup of this handle.
+    pub last_accessed_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

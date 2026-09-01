@@ -34,9 +34,14 @@ async fn main() -> Result<()> {
 
     let settings = Settings::from_env()?;
     let state = Arc::new(AppState {
-        engine: CoreEngine::new(settings.batch_size, settings.max_open_datasets),
+        engine: CoreEngine::new(
+            settings.batch_size,
+            settings.max_open_datasets,
+            settings.dataset_idle_timeout_seconds,
+        ),
         settings: settings.clone(),
     });
+    spawn_dataset_handle_cleanup(Arc::clone(&state));
 
     let cors = if settings.cors_origins.iter().any(|origin| origin == "*") {
         CorsLayer::new().allow_origin(Any).allow_headers(Any).allow_methods(Any)
@@ -56,6 +61,35 @@ async fn main() -> Result<()> {
     tracing::info!(address = %settings.bind, "parquet-viewer-server listening");
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
+}
+
+/// Periodically remove abandoned in-memory dataset handles.
+///
+/// Exact expiration is also checked synchronously whenever a handle is used.
+/// This task is therefore housekeeping rather than part of request correctness:
+/// it frees handles left behind by closed/crashed browser sessions even when no
+/// subsequent request references those IDs.
+fn spawn_dataset_handle_cleanup(state: Arc<AppState>) {
+    let Some(interval) = state.engine.dataset_cleanup_interval() else {
+        tracing::info!("dataset handle idle expiration is disabled");
+        return;
+    };
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // `interval` ticks immediately once. Consume that tick so cleanup begins
+        // after one interval instead of immediately after startup.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let removed = state.engine.prune_expired_datasets();
+            if removed > 0 {
+                tracing::info!(removed, "pruned expired dataset handles");
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {

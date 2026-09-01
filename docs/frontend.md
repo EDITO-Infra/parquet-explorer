@@ -1,192 +1,93 @@
 # Frontend
 
-## Role of the frontend
+## Role
 
-The frontend is a React application responsible for interaction, presentation, browser-side decoding, and map rendering. It should treat the Rust service as the source of truth for Parquet semantics and physical-layout analysis.
+The frontend is the browser workspace for opening a dataset, exploring rows, inspecting schema/statistics, viewing a map snapshot, and seeing request progress/diagnostics.
 
-The browser receives two main forms of data:
+Parquet reading and physical-layout interpretation remain backend responsibilities.
 
-- JSON for dataset metadata, analysis, counts, and diagnostics;
-- Arrow IPC streams for rows.
+## Source organization
 
-## Main state
-
-`App.tsx` currently coordinates the high-level viewer state:
-
-- active dataset handle and URI;
-- active tab;
-- table offset/limit;
-- visible columns;
-- filter clauses;
-- loaded rows;
-- map snapshot state;
-- progress/diagnostic activity;
-- application theme.
-
-The exact component split may evolve. The stable idea is that table state and map snapshot state are related but not identical.
-
-## Opening a dataset
-
-When the user opens a URL:
+The frontend is organized by ownership rather than by page:
 
 ```text
-form submit
-  ↓
-create client trace ID
-  ↓
-POST /datasets/open
-  ↓
-receive DatasetInfo
-  ↓
-initialize columns/count/spatial metadata
-  ↓
-load first table page
+src/frontend/src/
+├── App.tsx              shared workspace coordination
+├── main.tsx             browser entry point
+├── types.ts             shared frontend/API types
+├── lib/                 shared transport/data helpers
+└── features/
+    ├── dataset/         open/source/sidebar UI
+    ├── table/           filters, projection, paging, table
+    ├── schema/          schema/statistics presentation
+    ├── map/             spatial conversion + MapLibre
+    └── diagnostics/     trace lifecycle + progress UI
 ```
 
-Opening should remain metadata-oriented. The UI should become useful quickly without waiting for a large table or geometry read.
+`App.tsx` should coordinate state that genuinely crosses features. Feature-specific UI and logic should stay in the owning feature folder.
 
-## Table data flow
+## Shared data flow
 
-Table rows are streamed as Arrow IPC rather than returned as JSON objects.
+The common table path is:
 
 ```text
-page request
-  ↓
-fetch streaming response
-  ↓
-Arrow JS stream decoder
-  ↓
-RecordBatch
-  ↓
-plain rows for table presentation
+UI state
+  -> lib/api.ts
+  -> Rust API
+  -> Arrow IPC stream
+  -> Arrow JS RecordBatch
+  -> browser-friendly rows
+  -> table
 ```
 
-The frontend API helpers live in `api.ts`; Arrow-specific conversion helpers live in `arrow.ts`. UI components should generally consume typed application data rather than implement HTTP/Arrow protocol details themselves.
+`lib/api.ts` is the frontend transport boundary. React components should generally use its typed helpers instead of introducing scattered `fetch()` calls.
 
-### Visible columns affect backend work
+## Dataset IDs
 
-The selected table columns are sent as the query projection. This is an important performance behavior, not just a display preference: hiding an expensive column can avoid reading that Parquet column chunk.
+The frontend does not create dataset IDs. `openDataset()` receives `DatasetInfo` from the backend and `App.tsx` stores it in state. Subsequent requests use `dataset.dataset_id`.
 
-Spatial coordinate columns may be added to a request when needed for a fast map preview. Large WKB geometry is intentionally not forced into every ordinary table request.
+The ID is temporary and process-local. Opening another URL best-effort closes the previous handle. If a handle expires or the backend restarts, the source must be opened again.
 
-## Map model
+## State ownership
 
-The map is a **frozen snapshot**, not a live viewport query system.
+Keep state at the lowest level that needs to share it:
 
-When the user chooses to view the current result on the map, the application captures the current filter state and streams the complete matching spatial result once. Panning, zooming, changing basemap, or switching projection does not issue new Parquet queries.
+- active dataset, filters, projection, paging, and map snapshot coordination belong at the workspace level when multiple features need them;
+- local interaction state stays inside the relevant feature;
+- transport and Arrow conversion stay outside React components.
 
-This keeps map interaction predictable and makes the relationship between table filters and map content explicit.
+The aim is to avoid both a giant `App.tsx` and a large number of tiny components with no clear responsibility.
 
-The browser is responsible for converting spatial values into renderable GeoJSON features. WKB parsing occurs in browser code (`wkb.ts` / `spatialFeatures.ts`), while MapLibre handles visual rendering and interaction.
+## Table
 
-## Progress and diagnostics
+The table feature owns filter/projection controls, paging, and row rendering. Column selection affects the backend projection, so it can change physical read cost rather than merely hide columns visually.
 
-The progress surface merges two independent timelines:
+## Map
 
-### Backend events
+The map feature owns spatial-source selection, WKB/coordinate conversion, and MapLibre interaction. The current map is based on a frozen filtered snapshot; ordinary map interaction does not re-query Parquet.
 
-Polled from `/diagnostics/{trace_id}` and produced close to the engine/storage operations.
+## Diagnostics
 
-Examples:
+The diagnostics feature combines backend trace events with browser-side measurements. It must preserve the distinction between:
 
-- metadata storage reads;
-- Parquet reader milestones;
-- object-store bytes/time;
-- Arrow IPC encoding;
-- response-channel backpressure.
+- milestones (`@ elapsed time`);
+- measured/derived operation durations.
 
-### Browser events
-
-Measured directly with `performance.now()` around browser work.
-
-Examples:
-
-- waiting for headers/response bytes;
-- Arrow stream decoding;
-- constructing table rows;
-- WKB geometry decoding.
-
-The UI must preserve the distinction between a **milestone timestamp** and a **measured duration**. Do not infer a duration merely because one event appeared 60 seconds after another.
-
-Diagnostics are secondary to the data request. Polling failures are ignored so a temporary trace problem cannot break normal viewing.
+Browser timings cover work the backend cannot see, such as response-byte arrival, Arrow JS decoding, row materialization, and WKB decoding.
 
 ## Analysis UI
 
-Typed frontend helpers exist for the read-only analysis API even if the presentation continues to evolve.
+The backend analysis API and typed frontend API helpers exist, but there is currently no dedicated interactive Analysis view.
 
-The intended frontend rule is:
+**TODO:** add the Analysis UI under `features/analysis/`. Keep Parquet interpretation in Rust; the frontend should request and present analysis results rather than reproduce the calculations.
 
-> React decides how to display analysis; Rust decides what the Parquet layout means.
+Avoid documenting the planned layout/components in more detail until that UI exists.
 
-For example, the frontend may render a storage-by-column chart, but the calculation of compressed bytes per Parquet leaf column should come from `/analysis/columns`, not be recreated from unrelated metadata in JavaScript.
+## Frontend rules worth preserving
 
-A future Analysis tab can progressively disclose detail:
-
-```text
-Summary
-  row groups / sizes / compression / index coverage
-
-Storage by column
-  geometry 96%
-  name 2%
-  ...
-
-Query cost
-  estimated bytes for current table projection/filter
-
-Findings
-  advisory explanations
-
-Technical details
-  row groups / page indexes
-```
-
-## Component responsibilities
-
-Current files roughly map to these concerns:
-
-| File | Responsibility |
-|---|---|
-| `App.tsx` | high-level state and workflows |
-| `api.ts` | HTTP requests and streamed API access |
-| `types.ts` | frontend API/application types |
-| `arrow.ts` | Arrow batch/row conversion |
-| `DataTable.tsx` | table presentation |
-| `ColumnPicker.tsx` | projection/visibility controls |
-| `FilterBar.tsx` | user filter construction |
-| `ProgressPanel.tsx` | user progress + expandable diagnostics |
-| `MapPanel.tsx` | MapLibre map interaction/rendering |
-| `spatialFeatures.ts` | rows/batches to map features |
-| `wkb.ts` | WKB parsing |
-| `spatial.ts` / `geo.ts` | spatial source/metadata helpers |
-
-This table describes intent, not a requirement to preserve the current component boundaries forever.
-
-## Frontend performance principles
-
-A few principles are more durable than implementation details:
-
-- Stream rows; do not wait for a whole large result before decoding.
-- Keep projections narrow when possible.
-- Do not decode WKB unless geometry is actually needed.
-- Do not turn map interaction into repeated remote Parquet scans without an explicit design change.
-- Attribute time to the correct layer before optimizing it.
-- Keep technical diagnostics available, but present normal users with plain-language progress first.
-
-## Error and stale-request handling
-
-Interactive applications can have overlapping requests—for example, a user changes page or projection before an earlier response completes. The frontend uses request/trace IDs to avoid applying stale results to newer state.
-
-When extending a workflow, consider both success and obsolescence: a response may be valid but no longer relevant to the current UI state.
-
-## Adding a new backend capability to the UI
-
-A clean path is:
-
-1. define/confirm the backend API model;
-2. add matching TypeScript types in `types.ts`;
-3. add a small typed function in `api.ts`;
-4. keep protocol/parsing concerns there;
-5. let a component consume the typed result.
-
-Avoid embedding ad-hoc `fetch()` calls and Parquet-specific interpretation across multiple components.
+- Keep Parquet analysis logic out of React.
+- Keep shared HTTP/Arrow transport behind `lib/api.ts`.
+- Stream row results where practical.
+- Avoid reading/decoding geometry unless it is needed.
+- Ignore stale asynchronous results when newer requests supersede them.
+- Split code around coherent responsibilities, not arbitrary line counts.

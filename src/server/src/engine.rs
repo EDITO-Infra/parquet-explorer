@@ -16,7 +16,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -59,17 +59,30 @@ pub struct CoreEngine {
     batch_size: usize,
     ipc_channel_capacity: usize,
     max_open_datasets: usize,
+    /// How long an unused process-local dataset handle remains valid.
+    /// `None` means expiration was explicitly disabled by configuration.
+    dataset_idle_timeout: Option<Duration>,
     traces: TraceStore,
 }
 
 impl CoreEngine {
-    /// Construct an engine with a fixed Arrow batch size and handle limit.
-    pub fn new(batch_size: usize, max_open_datasets: usize) -> Self {
+    /// Construct an engine with fixed query limits and dataset-handle lifetime.
+    ///
+    /// `dataset_idle_timeout_seconds = 0` disables idle expiration. In normal
+    /// deployments a finite timeout is preferred because a browser can vanish
+    /// without sending `DELETE /datasets/{id}`.
+    pub fn new(
+        batch_size: usize,
+        max_open_datasets: usize,
+        dataset_idle_timeout_seconds: u64,
+    ) -> Self {
         Self {
             datasets: RwLock::new(HashMap::new()),
             batch_size,
             ipc_channel_capacity: 4,
             max_open_datasets,
+            dataset_idle_timeout: (dataset_idle_timeout_seconds > 0)
+                .then(|| Duration::from_secs(dataset_idle_timeout_seconds)),
             traces: TraceStore::default(),
         }
     }
@@ -83,6 +96,11 @@ impl CoreEngine {
         trace_id: Option<&str>,
     ) -> Result<DatasetInfo> {
         let trace = self.traces.reporter(trace_id);
+
+        // A browser may disappear without explicitly closing its handle. Drop
+        // idle entries before applying the capacity limit so abandoned sessions
+        // cannot permanently consume all available handle slots.
+        self.prune_expired_datasets();
         if self.datasets.read().len() >= self.max_open_datasets {
             if let Some(trace) = &trace { trace.fail("Too many datasets are already open"); }
             bail!("maximum number of open dataset handles reached");
@@ -111,11 +129,20 @@ impl CoreEngine {
         let info = build_dataset_info(&dataset_id, name, uri, &builder)?;
 
         let mut datasets = self.datasets.write();
+        Self::prune_expired_locked(&mut datasets, self.dataset_idle_timeout, Instant::now());
         if datasets.len() >= self.max_open_datasets {
             if let Some(trace) = &trace { trace.fail("Too many datasets are already open"); }
             bail!("maximum number of open dataset handles reached");
         }
-        datasets.insert(dataset_id, DatasetEntry { info: info.clone() });
+        let now = Instant::now();
+        datasets.insert(
+            dataset_id,
+            DatasetEntry {
+                info: info.clone(),
+                opened_at: now,
+                last_accessed_at: now,
+            },
+        );
         if let Some(trace) = &trace {
             trace.finish_with_detail(
                 "Dataset ready",
@@ -150,12 +177,10 @@ impl CoreEngine {
     }
 
     /// Return the lightweight metadata cached when the dataset was opened.
+    ///
+    /// Resolving the handle counts as activity and refreshes its idle lifetime.
     pub fn metadata(&self, dataset_id: &str) -> Result<DatasetInfo> {
-        self.datasets
-            .read()
-            .get(dataset_id)
-            .map(|entry| entry.info.clone())
-            .ok_or_else(|| anyhow!("dataset not found: {dataset_id}"))
+        Ok(self.entry(dataset_id)?.info)
     }
 
     /// Return a cheap physical-layout summary derived from the Parquet footer.
@@ -215,6 +240,27 @@ impl CoreEngine {
     ) -> Result<AnalysisRecommendationsResponse> {
         let entry = self.entry(dataset_id)?;
         analysis::recommendations(dataset_id, &entry.info.uri, &entry.info).await
+    }
+
+    /// Return the cadence used by the background handle-cleanup task.
+    ///
+    /// Handle lookup itself enforces the exact idle timeout. The periodic task
+    /// exists only to release abandoned entries even when no later request
+    /// happens to touch them. Capping cleanup at one minute keeps that task cheap
+    /// while avoiding long-lived stale entries for normal timeout values.
+    pub fn dataset_cleanup_interval(&self) -> Option<Duration> {
+        self.dataset_idle_timeout.map(|timeout| {
+            Duration::from_secs(timeout.as_secs().clamp(1, 60))
+        })
+    }
+
+    /// Remove all dataset handles whose idle lifetime has elapsed.
+    ///
+    /// Returns the number removed so the server can emit a compact lifecycle log.
+    /// No network requests are made and source Parquet objects are never touched.
+    pub fn prune_expired_datasets(&self) -> usize {
+        let mut datasets = self.datasets.write();
+        Self::prune_expired_locked(&mut datasets, self.dataset_idle_timeout, Instant::now())
     }
 
     /// Drop an in-memory dataset handle. The source Parquet object is untouched.
@@ -451,12 +497,59 @@ impl CoreEngine {
         }
     }
 
+    /// Resolve a temporary dataset handle and refresh its idle lifetime.
+    ///
+    /// All engine operations that depend on an opened dataset should go through
+    /// this method. That gives the handle one consistent lifecycle rule instead
+    /// of requiring every API handler to remember to update activity timestamps.
     fn entry(&self, dataset_id: &str) -> Result<DatasetEntry> {
-        self.datasets
-            .read()
-            .get(dataset_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("dataset not found: {dataset_id}"))
+        let now = Instant::now();
+        let mut datasets = self.datasets.write();
+
+        if let Some(timeout) = self.dataset_idle_timeout {
+            let expired = datasets
+                .get(dataset_id)
+                .map(|entry| now.duration_since(entry.last_accessed_at) >= timeout)
+                .unwrap_or(false);
+            if expired {
+                datasets.remove(dataset_id);
+                bail!(
+                    "dataset not found: {dataset_id} (idle handle expired; reopen the source dataset)"
+                );
+            }
+        }
+
+        let entry = datasets
+            .get_mut(dataset_id)
+            .ok_or_else(|| anyhow!("dataset not found: {dataset_id}"))?;
+        entry.last_accessed_at = now;
+        Ok(entry.clone())
+    }
+
+    /// Retain only live handles while the caller already owns the dataset lock.
+    fn prune_expired_locked(
+        datasets: &mut HashMap<String, DatasetEntry>,
+        timeout: Option<Duration>,
+        now: Instant,
+    ) -> usize {
+        let Some(timeout) = timeout else { return 0; };
+        let before = datasets.len();
+
+        datasets.retain(|dataset_id, entry| {
+            let idle_for = now.duration_since(entry.last_accessed_at);
+            let keep = idle_for < timeout;
+            if !keep {
+                tracing::debug!(
+                    dataset_id = %dataset_id,
+                    idle_seconds = idle_for.as_secs_f64(),
+                    open_seconds = now.duration_since(entry.opened_at).as_secs_f64(),
+                    "expired idle dataset handle"
+                );
+            }
+            keep
+        });
+
+        before - datasets.len()
     }
 }
 

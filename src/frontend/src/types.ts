@@ -1,3 +1,11 @@
+/**
+ * Shared frontend data contracts.
+ *
+ * Most interfaces in this file mirror Rust API request/response models. A small
+ * number describe browser-only state such as a frozen map snapshot. These are
+ * TypeScript types only: they are erased when the browser bundle is built and do
+ * not execute at runtime.
+ */
 export interface ColumnInfo {
   name: string
   arrow_type: string

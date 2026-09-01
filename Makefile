@@ -1,4 +1,4 @@
-.PHONY: check test dev-backend dev-frontend build-backend build-frontend docker
+.PHONY: check test dev-backend dev-frontend build-backend build-frontend docker docs docs-build docs-preview
 
 check:
 	cargo check --manifest-path src/server/Cargo.toml
@@ -20,3 +20,12 @@ build-frontend:
 
 docker:
 	docker compose up --build
+
+docs:
+	cd docs && npm run dev
+
+docs-build:
+	cd docs && npm run build
+
+docs-preview:
+	cd docs && npm run preview

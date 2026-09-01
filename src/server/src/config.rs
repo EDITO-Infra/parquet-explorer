@@ -22,6 +22,8 @@ pub struct Settings {
     pub max_spatial_features: usize,
     pub batch_size: usize,
     pub max_open_datasets: usize,
+    /// Idle lifetime of an in-memory dataset handle. `0` disables expiration.
+    pub dataset_idle_timeout_seconds: u64,
 }
 
 impl Settings {
@@ -45,6 +47,7 @@ impl Settings {
             max_spatial_features: number("PV_MAX_SPATIAL_FEATURES", 100_000)?,
             batch_size: number("PV_BATCH_SIZE", 8_192)?,
             max_open_datasets: number("PV_MAX_OPEN_DATASETS", 512)?,
+            dataset_idle_timeout_seconds: number("PV_DATASET_IDLE_TIMEOUT_SECONDS", 3_600_u64)?,
         })
     }
 }

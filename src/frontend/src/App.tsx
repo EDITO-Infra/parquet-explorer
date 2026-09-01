@@ -1,20 +1,38 @@
+/**
+ * Top-level viewer coordinator.
+ *
+ * App owns state that must be shared across the main viewer areas (dataset,
+ * filters, paging, selected columns, map snapshot and diagnostics) and
+ * coordinates the major workflows that connect UI actions to the API.
+ *
+ * It deliberately does NOT implement Parquet parsing, Arrow IPC decoding, trace
+ * polling, or large feature-specific view trees. Those concerns live under
+ * `lib/` and `features/`. App remains the one place where state shared by Table,
+ * Map, Schema and future Analysis views is coordinated.
+ */
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { FormEvent, ReactNode } from 'react'
 import type { Feature } from 'geojson'
-import { batchRows, type PlainRow } from './arrow'
-import { closeDataset, countRows, downloadSubset, getTrace, openDataset, pageBatches } from './api'
-import { ColumnPicker } from './ColumnPicker'
-import { DataTable } from './DataTable'
-import { FilterBar } from './FilterBar'
-import { MapPanel, type MapActivityUpdate } from './MapPanel'
-import { ProgressPanel, type ActivityState } from './ProgressPanel'
-import { detectSpatialSource } from './spatial'
-import { appendSpatialBatchFeatures, spatialColumnNames } from './spatialFeatures'
+import { batchRows, type PlainRow } from './lib/arrow'
+import { closeDataset, countRows, openDataset, pageBatches } from './lib/api'
+import { DatasetSidebar } from './features/dataset/DatasetSidebar'
+import { LandingPanel } from './features/dataset/LandingPanel'
+import { OpenFileBar } from './features/dataset/OpenFileBar'
+import { ProgressPanel } from './features/diagnostics/ProgressPanel'
+import { useActivityTrace } from './features/diagnostics/useActivityTrace'
+import { MapPanel, type MapActivityUpdate } from './features/map/MapPanel'
+import { detectSpatialSource } from './features/map/spatial'
+import { appendSpatialBatchFeatures, spatialColumnNames } from './features/map/spatialFeatures'
+import { SchemaPanel } from './features/schema/SchemaPanel'
+import { TablePanel } from './features/table/TablePanel'
 import type { DatasetInfo, FilterClause, MapSnapshotSpec } from './types'
 
 type Tab = 'data' | 'map' | 'schema'
 type Theme = 'light' | 'dark'
 
 export default function App() {
+  // Shared workspace state. These values affect more than one child component,
+  // so App is the lowest sensible common owner for them.
   const [uri, setUri] = useState('')
   const [dataset, setDataset] = useState<DatasetInfo | null>(null)
   const [tab, setTab] = useState<Tab>('data')
@@ -32,36 +50,40 @@ export default function App() {
   const [mapSnapshot, setMapSnapshot] = useState<MapSnapshotSpec | null>(null)
   const [mapPageFeatures, setMapPageFeatures] = useState<Feature[]>([])
   const [mapSnapshotSeed, setMapSnapshotSeed] = useState<Feature[]>([])
-  const [activity, setActivity] = useState<ActivityState | null>(null)
+  // Request IDs are monotonic guards against stale async results. A valid old
+  // response must not overwrite state produced by a newer user action.
   const pageRequestId = useRef(0)
   const mapSnapshotId = useRef(0)
-  const activeTraceId = useRef<string | null>(null)
+
+  // All viewer features report progress through one shared trace lifecycle.
+  const {
+    activity,
+    beginActivity,
+    addClientActivity,
+    finishActivity,
+    failActivity,
+  } = useActivityTrace()
 
   const spatialSource = useMemo(
     () => dataset ? detectSpatialSource(dataset) : undefined,
     [dataset],
   )
 
+  // Synchronize React theme state with the document and persisted preference.
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     window.localStorage.setItem('parquet-viewer-theme', theme)
   }, [theme])
 
-  useEffect(() => {
-    if (!activity || activity.status !== 'running') return
-    const timer = window.setInterval(() => {
-      setActivity(current => current?.status === 'running'
-        ? { ...current, elapsedMs: performance.now() - current.startedAt }
-        : current)
-    }, 100)
-    return () => window.clearInterval(timer)
-  }, [activity?.traceId, activity?.status])
-
+  // Table queries are derived from dataset + paging + filters + projection.
+  // Changing any of those inputs invalidates the current page and triggers a read.
   useEffect(() => {
     if (!dataset) return
     void loadPage(dataset, offset, limit, visibleColumns)
   }, [dataset?.dataset_id, offset, limit, filters, visibleColumns])
 
+  // The unfiltered row count comes from footer metadata. Filtered counts require
+  // a backend query and are kept separate from page loading.
   useEffect(() => {
     if (!dataset) return
     if (filters.length === 0) {
@@ -82,108 +104,8 @@ export default function App() {
     return () => { cancelled = true }
   }, [dataset?.dataset_id, filters])
 
-  function beginActivity(traceId: string, title: string, current: string) {
-    activeTraceId.current = traceId
-    const startedAt = performance.now()
-    setActivity({
-      traceId,
-      title,
-      current,
-      status: 'running',
-      startedAt,
-      elapsedMs: 0,
-      clientEvents: [],
-    })
-    void monitorTrace(traceId)
-  }
-
-  function addClientActivity(
-    traceId: string,
-    message: string,
-    detail?: string,
-    progress?: number,
-    durationMs?: number,
-  ) {
-    setActivity(current => {
-      if (!current || current.traceId !== traceId) return current
-      const elapsedMs = performance.now() - current.startedAt
-      return {
-        ...current,
-        current: message,
-        progress: progress ?? current.progress,
-        elapsedMs,
-        clientEvents: [...current.clientEvents, {
-          message,
-          detail,
-          elapsedMs,
-          durationMs,
-          source: 'Browser',
-        }],
-      }
-    })
-  }
-
-  function finishActivity(traceId: string, message: string, detail?: string) {
-    setActivity(current => {
-      if (!current || current.traceId !== traceId) return current
-      const elapsedMs = performance.now() - current.startedAt
-      return {
-        ...current,
-        current: message,
-        status: 'complete',
-        progress: 1,
-        elapsedMs,
-        clientEvents: [...current.clientEvents, {
-          message,
-          detail,
-          elapsedMs,
-          source: 'Browser',
-        }],
-      }
-    })
-  }
-
-  function failActivity(traceId: string, message: string) {
-    setActivity(current => {
-      if (!current || current.traceId !== traceId) return current
-      return {
-        ...current,
-        current: message,
-        status: 'error',
-        elapsedMs: performance.now() - current.startedAt,
-      }
-    })
-  }
-
-  async function monitorTrace(traceId: string) {
-    let seen = false
-    for (let attempt = 0; attempt < 900; attempt += 1) {
-      if (activeTraceId.current !== traceId) return
-      try {
-        const trace = await getTrace(traceId)
-        if (trace) {
-          seen = true
-          setActivity(current => {
-            if (!current || current.traceId !== traceId) return current
-            const last = trace.events.at(-1)
-            return {
-              ...current,
-              trace,
-              current: trace.status === 'running' && last ? last.message : current.current,
-              elapsedMs: Math.max(current.elapsedMs, trace.elapsed_ms),
-            }
-          })
-          if (trace.status !== 'running') return
-        }
-      } catch {
-        // Diagnostics must never interrupt the actual query.
-      }
-      if (!seen && attempt >= 40) return
-      await delay(120)
-    }
-  }
-
-  async function onOpen(event: React.FormEvent) {
+  /** Open a URL and reset all dataset-dependent UI state around the new handle. */
+  async function onOpen(event: FormEvent) {
     event.preventDefault()
     if (!uri.trim()) return
 
@@ -194,9 +116,14 @@ export default function App() {
 
     try {
       if (dataset) {
+        // Dataset IDs are temporary server-side handles. Close the previous one
+        // when changing URLs, but keep this best-effort: the backend idle TTL
+        // also cleans it up if the browser disappears or this request fails.
         await closeDataset(dataset.dataset_id).catch(() => undefined)
       }
 
+      // `/datasets/open` generates a fresh process-local handle. Store the full
+      // DatasetInfo because every later feature uses `dataset.dataset_id`.
       const info = await openDataset(uri.trim(), undefined, traceId)
       addClientActivity(traceId, 'Preparing the viewer', `${info.columns.length} fields found`)
 
@@ -219,6 +146,12 @@ export default function App() {
     }
   }
 
+  /**
+   * Stream one table page as Arrow batches.
+   *
+   * The backend projection follows visibleColumns, while extra spatial columns
+   * may be requested only when they enable the lightweight map preview.
+   */
   async function loadPage(
     info: DatasetInfo,
     pageOffset: number,
@@ -336,6 +269,7 @@ export default function App() {
     }
   }
 
+  /** Freeze the current filter/count state into a map snapshot specification. */
   function switchToMap() {
     if (!dataset || !spatialSource || totalRows == null || countLoading) return
 
@@ -393,114 +327,25 @@ export default function App() {
         </div>
       </header>
 
-      <form className="open-bar" onSubmit={onOpen}>
-        <div className="open-input-wrap">
-          <span className="open-input-label">Parquet URL</span>
-          <input
-            value={uri}
-            onChange={event => setUri(event.target.value)}
-            placeholder="https://example.com/data.parquet"
-            aria-label="Parquet URL"
-          />
-        </div>
-        <button disabled={opening || !uri.trim()}>
-          {opening ? 'Opening…' : 'Open file'}
-        </button>
-      </form>
+      <OpenFileBar
+        uri={uri}
+        opening={opening}
+        onUriChange={setUri}
+        onOpen={onOpen}
+      />
 
       {error && <div className="error-banner">{error}</div>}
       <ProgressPanel activity={activity} />
 
       {!dataset ? (
-        <main className="landing">
-          <div className="landing-card">
-            <span className="eyebrow">Parquet + GeoParquet</span>
-            <h2>Explore a Parquet file without downloading it first.</h2>
-            <p>
-              Paste a file URL to preview rows, filter values, inspect the schema,
-              and map spatial data when it is available.
-            </p>
-            <div className="landing-features" aria-label="Viewer features">
-              <span>Preview rows</span>
-              <span>Filter data</span>
-              <span>Inspect fields</span>
-              <span>Map geometry</span>
-            </div>
-          </div>
-        </main>
+        <LandingPanel />
       ) : (
         <main className="workspace">
-          <aside className="sidebar">
-            <div className="side-section dataset-summary">
-              <span className="section-label">Current file</span>
-              <div className="uri" title={dataset.uri}>
-                {dataset.name || filename(dataset.uri)}
-              </div>
-              <div className="muted source-uri" title={dataset.uri}>{dataset.uri}</div>
-            </div>
-
-            <details className="side-section file-details">
-              <summary>File details</summary>
-              <div className="stats-grid compact-stats">
-                <Metric label="Rows" value={dataset.num_rows.toLocaleString()} />
-                <Metric label="Fields" value={String(dataset.columns.length)} />
-                <Metric label="Row groups" value={String(dataset.num_row_groups)} />
-                <Metric label="Spatial" value={spatialSource ? 'Yes' : 'No'} />
-              </div>
-
-              {spatialSource && (
-                <div className="spatial-details">
-                  <span className="section-label">Spatial data</span>
-                  {spatialSource.kind === 'coordinates' ? (
-                    <dl className="metadata-list">
-                      <dt>Type</dt><dd>Coordinates</dd>
-                      <dt>Longitude</dt><dd>{spatialSource.longitude}</dd>
-                      <dt>Latitude</dt><dd>{spatialSource.latitude}</dd>
-                    </dl>
-                  ) : (
-                    <dl className="metadata-list">
-                      <dt>Field</dt><dd>{spatialSource.geometry.name}</dd>
-                      <dt>Type</dt><dd>{spatialSource.geometry.logical_type}</dd>
-                      <dt>CRS</dt><dd>{spatialSource.geometry.crs}</dd>
-                      <dt>Bbox stats</dt>
-                      <dd>
-                        {spatialSource.geometry.row_groups_with_bbox}/
-                        {spatialSource.geometry.row_groups_total} row groups
-                      </dd>
-                    </dl>
-                  )}
-                </div>
-              )}
-            </details>
-
-            <div className="side-section">
-              <span className="section-label">Download</span>
-              <div className="button-stack">
-                <button
-                  className="secondary"
-                  onClick={() => void downloadSubset(
-                    dataset.dataset_id,
-                    'parquet',
-                    undefined,
-                    filters,
-                  )}
-                >
-                  Save as Parquet
-                </button>
-                <button
-                  className="secondary"
-                  onClick={() => void downloadSubset(
-                    dataset.dataset_id,
-                    'arrow',
-                    undefined,
-                    filters,
-                  )}
-                >
-                  Save as Arrow
-                </button>
-              </div>
-            </div>
-          </aside>
+          <DatasetSidebar
+            dataset={dataset}
+            spatialSource={spatialSource}
+            filters={filters}
+          />
 
           <section className="content">
             <nav className="tabs">
@@ -520,92 +365,33 @@ export default function App() {
             </nav>
 
             {tab === 'data' && (
-              <section className="pane">
-                <FilterBar
-                  columns={dataset.columns}
-                  filters={filters}
-                  disabled={loading}
-                  onApply={next => {
-                    setOffset(0)
-                    setFilters(next)
-                  }}
-                />
-
-                <div className="pane-toolbar">
-                  <div className="pager">
-                    <button
-                      className="secondary"
-                      disabled={offset === 0 || loading || visibleColumns.length === 0}
-                      onClick={() => setOffset(Math.max(0, offset - limit))}
-                    >
-                      Previous
-                    </button>
-                    <span>
-                      {visibleColumns.length === 0
-                        ? `No columns selected · ${countLoading || totalRows == null ? 'counting…' : totalRows.toLocaleString()}${filters.length ? ' matching' : ' rows'}`
-                        : `${rows.length ? `${(offset + 1).toLocaleString()}–${(offset + rows.length).toLocaleString()}` : '0 rows'} of ${countLoading || totalRows == null ? 'counting…' : totalRows.toLocaleString()}${filters.length ? ' matching' : ''}`}
-                    </span>
-                    <button
-                      className="secondary"
-                      disabled={
-                        loading
-                        || countLoading
-                        || visibleColumns.length === 0
-                        || totalRows == null
-                        || offset + rows.length >= totalRows
-                      }
-                      onClick={() => setOffset(offset + limit)}
-                    >
-                      Next
-                    </button>
-                  </div>
-
-                  <div className="table-controls">
-                    {spatialSource && (
-                      <button
-                        type="button"
-                        className="map-switch-button"
-                        disabled={loading || countLoading || totalRows == null}
-                        onClick={switchToMap}
-                        title="Create a map from the current filtered result"
-                      >
-                        {countLoading
-                          ? 'Counting…'
-                          : mapSnapshot && sameFilters(mapSnapshot.filters, filters)
-                            ? 'Refresh map'
-                            : 'View on map'}
-                      </button>
-                    )}
-                    <ColumnPicker
-                      columns={dataset.columns}
-                      visibleColumns={visibleColumns}
-                      disabled={loading}
-                      onChange={next => {
-                        setOffset(0)
-                        setVisibleColumns(next)
-                      }}
-                    />
-                    <label>
-                      Rows per page{' '}
-                      <select
-                        value={limit}
-                        disabled={loading}
-                        onChange={event => {
-                          setOffset(0)
-                          setLimit(Number(event.target.value))
-                        }}
-                      >
-                        <option>250</option>
-                        <option>1000</option>
-                        <option>5000</option>
-                        <option>10000</option>
-                      </select>
-                    </label>
-                  </div>
-                </div>
-
-                <DataTable columns={visibleColumns} rows={rows} />
-              </section>
+              <TablePanel
+                dataset={dataset}
+                rows={rows}
+                filters={filters}
+                visibleColumns={visibleColumns}
+                offset={offset}
+                limit={limit}
+                totalRows={totalRows}
+                loading={loading}
+                countLoading={countLoading}
+                spatialSource={spatialSource}
+                mapSnapshot={mapSnapshot}
+                onApplyFilters={next => {
+                  setOffset(0)
+                  setFilters(next)
+                }}
+                onOffsetChange={setOffset}
+                onVisibleColumnsChange={next => {
+                  setOffset(0)
+                  setVisibleColumns(next)
+                }}
+                onLimitChange={next => {
+                  setOffset(0)
+                  setLimit(next)
+                }}
+                onViewMap={switchToMap}
+              />
             )}
 
             {spatialSource && mapSnapshot && (
@@ -626,62 +412,7 @@ export default function App() {
             )}
 
             {tab === 'schema' && (
-              <section className="pane schema-pane">
-                <div className="schema-intro">
-                  <div>
-                    <span className="eyebrow">File overview</span>
-                    <h2>Schema &amp; statistics</h2>
-                    <p>Structure, storage layout, and spatial metadata for this file.</p>
-                  </div>
-                </div>
-
-                <div className="schema-summary schema-stats">
-                  <StatCard label="Rows" value={dataset.num_rows.toLocaleString()} help="Total rows reported by the file metadata" />
-                  <StatCard label="Fields" value={String(dataset.columns.length)} help="Columns available to query" />
-                  <StatCard label="Row groups" value={String(dataset.num_row_groups)} help="Parquet storage groups used for reads" />
-                  <StatCard label="Spatial" value={spatialSource ? 'Available' : 'Not detected'} help={spatialSource ? 'Map view can be created' : 'No geometry or coordinate pair detected'} />
-                </div>
-
-                {dataset.geo_parquet && (
-                  <div className="schema-summary technical-stats">
-                    <StatCard label="GeoParquet" value={dataset.geo_parquet.version} help={`Primary field: ${dataset.geo_parquet.primary_column}`} />
-                    <StatCard label="Metadata checks" value={dataset.geo_parquet.v2_metadata_checks_passed ? 'Passed' : 'Review'} help="GeoParquet metadata validation" />
-                    <StatCard label="Exact spatial filter" value={dataset.capabilities.spatial_exact ? 'Enabled' : 'Not yet'} help="Current map query capability" />
-                  </div>
-                )}
-
-                {dataset.geo_parquet?.warnings.length ? (
-                  <div className="warning-box">
-                    <strong>Metadata notes</strong>
-                    {dataset.geo_parquet.warnings.map(warning => (
-                      <div key={warning}>{warning}</div>
-                    ))}
-                  </div>
-                ) : null}
-
-                <div className="schema-section-head">
-                  <div>
-                    <h3>Fields</h3>
-                    <p>The logical and physical representation of each column.</p>
-                  </div>
-                </div>
-                <div className="schema-table">
-                  <div className="schema-row schema-head">
-                    <span>Field</span>
-                    <span>Data type</span>
-                    <span>Parquet storage</span>
-                    <span>Optional</span>
-                  </div>
-                  {dataset.columns.map(column => (
-                    <div className="schema-row" key={column.name}>
-                      <span>{column.name}</span>
-                      <span className="mono">{column.arrow_type}</span>
-                      <span>{column.parquet_physical_type ?? '—'}</span>
-                      <span>{column.nullable ? 'Yes' : 'No'}</span>
-                    </div>
-                  ))}
-                </div>
-              </section>
+              <SchemaPanel dataset={dataset} spatialAvailable={Boolean(spatialSource)} />
             )}
           </section>
         </main>
@@ -699,7 +430,7 @@ function TabButton({
   active: boolean
   disabled?: boolean
   onClick: () => void
-  children: React.ReactNode
+  children: ReactNode
 }) {
   return (
     <button
@@ -712,33 +443,10 @@ function TabButton({
   )
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <span className="metric-value">{value}</span>
-      <span className="metric-label">{label}</span>
-    </div>
-  )
-}
-
-function StatCard({ label, value, help }: { label: string; value: string; help: string }) {
-  return (
-    <div className="stat-card">
-      <span className="section-label">{label}</span>
-      <strong>{value}</strong>
-      <p>{help}</p>
-    </div>
-  )
-}
-
 function getInitialTheme(): Theme {
   const saved = window.localStorage.getItem('parquet-viewer-theme')
   if (saved === 'light' || saved === 'dark') return saved
   return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
-}
-
-function sameFilters(left: FilterClause[], right: FilterClause[]): boolean {
-  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 function filename(uri: string) {
@@ -754,6 +462,3 @@ function makeTraceId(prefix: string) {
   return `${prefix}-${random}`
 }
 
-function delay(ms: number) {
-  return new Promise(resolve => window.setTimeout(resolve, ms))
-}
