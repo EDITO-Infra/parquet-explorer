@@ -1,7 +1,14 @@
+//! Environment-backed server configuration.
+//!
+//! Settings here control listener/CORS behavior, source-URL security policy,
+//! query limits, and engine capacity. Parsing is centralized so request code
+//! does not repeatedly interpret environment variables.
+
 use std::{collections::HashSet, env, net::{IpAddr, SocketAddr}, path::PathBuf};
 
 use anyhow::{Context, Result};
 
+/// Complete runtime configuration loaded once during server startup.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub bind: SocketAddr,
@@ -18,6 +25,7 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// Parse and validate supported `PV_*` environment variables.
     pub fn from_env() -> Result<Self> {
         let host = env::var("PV_HOST").unwrap_or_else(|_| "0.0.0.0".into());
         let port = env::var("PV_PORT").unwrap_or_else(|_| "8080".into()).parse::<u16>()

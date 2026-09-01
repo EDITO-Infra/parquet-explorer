@@ -1,9 +1,15 @@
+//! HTTP transport layer for `/api/v1`.
+//!
+//! Handlers in this file validate request-shape concerns and translate engine
+//! results into JSON, Arrow IPC streams, or downloadable files. Parquet logic
+//! belongs in `engine`; keeping handlers thin makes the engine reusable.
+
 use std::{io, sync::Arc};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::Response,
     routing::{delete, get, post},
@@ -16,8 +22,11 @@ use crate::{
     AppState,
     error::ApiError,
     model::{
+        AnalysisRecommendationsResponse, AnalysisSummaryResponse, ColumnsAnalysisResponse,
         CountRequest, CountResponse, DatasetInfo, DatasetOpenRequest, ExportRequest,
-        HealthResponse, PageRequest, SchemaResponse, SnapshotRequest, SpatialRequest,
+        HealthResponse, PageRequest, PagesAnalysisQuery, PagesAnalysisResponse, QueryCostRequest,
+        QueryCostResponse, RowGroupsAnalysisResponse, SchemaResponse, SnapshotRequest,
+        SpatialRequest,
     },
     security::validate_source_uri,
 };
@@ -30,11 +39,35 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/datasets/open", post(open_dataset))
         .route("/datasets/{dataset_id}/metadata", get(metadata))
         .route("/datasets/{dataset_id}/schema", get(schema))
+        // Read-only physical-layout analysis. These routes describe the source
+        // file; they never rewrite, move, upload, or otherwise manage it.
+        .route(
+            "/datasets/{dataset_id}/analysis/summary",
+            get(analysis_summary),
+        )
+        .route(
+            "/datasets/{dataset_id}/analysis/columns",
+            get(analysis_columns),
+        )
+        .route(
+            "/datasets/{dataset_id}/analysis/row-groups",
+            get(analysis_row_groups),
+        )
+        .route("/datasets/{dataset_id}/analysis/pages", get(analysis_pages))
+        .route(
+            "/datasets/{dataset_id}/analysis/query-cost",
+            post(analysis_query_cost),
+        )
+        .route(
+            "/datasets/{dataset_id}/analysis/recommendations",
+            get(analysis_recommendations),
+        )
         .route("/datasets/{dataset_id}/page", post(page))
         .route("/datasets/{dataset_id}/count", post(count))
         .route("/datasets/{dataset_id}/snapshot", post(snapshot))
         .route("/datasets/{dataset_id}/spatial", post(spatial))
         .route("/datasets/{dataset_id}/export", post(export))
+        .route("/diagnostics/{trace_id}", get(diagnostics))
         .route("/datasets/{dataset_id}", delete(close_dataset))
         .with_state(state)
 }
@@ -57,12 +90,27 @@ async fn open_dataset(
         return Err(ApiError::bad_request("name exceeds 256 characters"));
     }
 
-    let uri = validate_source_uri(&payload.uri, &state.settings)
-        .await
-        .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+    let trace_id = payload.trace_id.clone();
+    state
+        .engine
+        .start_trace(trace_id.as_deref(), "open", "Checking source URL");
+    let uri = match validate_source_uri(&payload.uri, &state.settings).await {
+        Ok(uri) => uri,
+        Err(error) => {
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Source URL was rejected");
+            return Err(ApiError::bad_request(format!("{error:#}")));
+        }
+    };
+    state.engine.trace_event(
+        trace_id.as_deref(),
+        "source_validated",
+        "Source URL accepted",
+    );
     let info = state
         .engine
-        .open_dataset(&uri, payload.name)
+        .open_dataset(&uri, payload.name, trace_id.as_deref())
         .await
         .map_err(ApiError::from_engine)?;
     Ok((StatusCode::CREATED, Json(info)))
@@ -94,6 +142,92 @@ async fn schema(
     }))
 }
 
+/// Return a cheap, footer-derived summary of the file's physical layout.
+async fn analysis_summary(
+    State(state): State<Arc<AppState>>,
+    Path(dataset_id): Path<String>,
+) -> Result<Json<AnalysisSummaryResponse>, ApiError> {
+    state
+        .engine
+        .analysis_summary(&dataset_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_engine)
+}
+
+/// Aggregate compressed storage and statistics coverage by Parquet leaf column.
+async fn analysis_columns(
+    State(state): State<Arc<AppState>>,
+    Path(dataset_id): Path<String>,
+) -> Result<Json<ColumnsAnalysisResponse>, ApiError> {
+    state
+        .engine
+        .analysis_columns(&dataset_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_engine)
+}
+
+/// Return row-group and column-chunk layout without reading data pages.
+async fn analysis_row_groups(
+    State(state): State<Arc<AppState>>,
+    Path(dataset_id): Path<String>,
+) -> Result<Json<RowGroupsAnalysisResponse>, ApiError> {
+    state
+        .engine
+        .analysis_row_groups(&dataset_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_engine)
+}
+
+/// Load optional Parquet page indexes for deeper page-level inspection.
+///
+/// Query parameters are optional: `row_group=0&column=geometry` can be used to
+/// keep the response small for large files.
+async fn analysis_pages(
+    State(state): State<Arc<AppState>>,
+    Path(dataset_id): Path<String>,
+    Query(query): Query<PagesAnalysisQuery>,
+) -> Result<Json<PagesAnalysisResponse>, ApiError> {
+    state
+        .engine
+        .analysis_pages(&dataset_id, query)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_engine)
+}
+
+/// Estimate compressed bytes a row query is likely to touch without executing it.
+async fn analysis_query_cost(
+    State(state): State<Arc<AppState>>,
+    Path(dataset_id): Path<String>,
+    Json(payload): Json<QueryCostRequest>,
+) -> Result<Json<QueryCostResponse>, ApiError> {
+    if payload.limit == 0 {
+        return Err(ApiError::bad_request("limit must be at least 1"));
+    }
+    state
+        .engine
+        .analysis_query_cost(&dataset_id, payload)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_engine)
+}
+
+/// Return read-only findings for characteristics that affect interactive access.
+async fn analysis_recommendations(
+    State(state): State<Arc<AppState>>,
+    Path(dataset_id): Path<String>,
+) -> Result<Json<AnalysisRecommendationsResponse>, ApiError> {
+    state
+        .engine
+        .analysis_recommendations(&dataset_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_engine)
+}
+
 async fn page(
     State(state): State<Arc<AppState>>,
     Path(dataset_id): Path<String>,
@@ -114,11 +248,16 @@ async fn page(
         )));
     }
 
-    let stream = state
-        .engine
-        .page_stream(&dataset_id, payload)
-        .await
-        .map_err(ApiError::from_engine)?;
+    let trace_id = payload.trace_id.clone();
+    let stream = match state.engine.page_stream(&dataset_id, payload).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Data query failed");
+            return Err(ApiError::from_engine(error));
+        }
+    };
 
     Ok(streaming_arrow_response(stream, None))
 }
@@ -128,11 +267,16 @@ async fn snapshot(
     Path(dataset_id): Path<String>,
     Json(payload): Json<SnapshotRequest>,
 ) -> Result<Response, ApiError> {
-    let stream = state
-        .engine
-        .snapshot_stream(&dataset_id, payload)
-        .await
-        .map_err(ApiError::from_engine)?;
+    let trace_id = payload.trace_id.clone();
+    let stream = match state.engine.snapshot_stream(&dataset_id, payload).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Map data query failed");
+            return Err(ApiError::from_engine(error));
+        }
+    };
 
     Ok(streaming_arrow_response(stream, None))
 }
@@ -142,11 +286,16 @@ async fn count(
     Path(dataset_id): Path<String>,
     Json(payload): Json<CountRequest>,
 ) -> Result<Json<CountResponse>, ApiError> {
-    let count = state
-        .engine
-        .count_rows(&dataset_id, payload)
-        .await
-        .map_err(ApiError::from_engine)?;
+    let trace_id = payload.trace_id.clone();
+    let count = match state.engine.count_rows(&dataset_id, payload).await {
+        Ok(count) => count,
+        Err(error) => {
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Count query failed");
+            return Err(ApiError::from_engine(error));
+        }
+    };
     Ok(Json(CountResponse { count }))
 }
 
@@ -162,11 +311,16 @@ async fn spatial(
         .max_features
         .min(state.settings.max_spatial_features);
 
-    let stream = state
-        .engine
-        .spatial_stream(&dataset_id, payload)
-        .await
-        .map_err(ApiError::from_engine)?;
+    let trace_id = payload.trace_id.clone();
+    let stream = match state.engine.spatial_stream(&dataset_id, payload).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Spatial query failed");
+            return Err(ApiError::from_engine(error));
+        }
+    };
 
     Ok(streaming_arrow_response(
         stream,
@@ -228,6 +382,17 @@ async fn export(
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
+}
+
+async fn diagnostics(
+    State(state): State<Arc<AppState>>,
+    Path(trace_id): Path<String>,
+) -> Result<Json<crate::model::TraceSnapshot>, StatusCode> {
+    state
+        .engine
+        .trace_snapshot(&trace_id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn close_dataset(

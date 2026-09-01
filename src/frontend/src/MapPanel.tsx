@@ -43,6 +43,12 @@ type ProjectionMode = 'mercator' | 'globe'
 type Theme = 'light' | 'dark'
 type FeatureId = string | number
 
+export type MapActivityUpdate =
+  | { type: 'start'; traceId: string; message: string }
+  | { type: 'progress'; traceId: string; message: string; detail?: string; progress?: number; durationMs?: number }
+  | { type: 'complete'; traceId: string; message: string; detail?: string }
+  | { type: 'error'; traceId: string; message: string }
+
 type SelectionBox = {
   left: number
   top: number
@@ -65,6 +71,7 @@ export function MapPanel({
   seedFeatures,
   theme,
   active,
+  onActivity,
 }: {
   dataset: DatasetInfo
   source: SpatialSource
@@ -72,6 +79,7 @@ export function MapPanel({
   seedFeatures: Feature[]
   theme: Theme
   active: boolean
+  onActivity?: (update: MapActivityUpdate) => void
 }) {
   const initialBasemap: BasemapId = theme === 'dark' ? 'dark' : 'positron'
   const container = useRef<HTMLDivElement | null>(null)
@@ -226,6 +234,8 @@ export function MapPanel({
     if (!map) return
 
     const thisRequest = ++requestId.current
+    const traceId = makeTraceId('map')
+    onActivity?.({ type: 'start', traceId, message: 'Preparing map query' })
     const seed = seedFeatures.slice()
     featuresRef.current = seed
     selectedIdsRef.current = []
@@ -234,8 +244,8 @@ export function MapPanel({
     setSelectedIds([])
     setSelectedProperties(null)
     setStatus(seed.length
-      ? `Showing ${seed.length.toLocaleString()} table-page features while freezing the full result…`
-      : 'Freezing filtered result…')
+      ? `Showing ${seed.length.toLocaleString()} preview features while loading the full map…`
+      : 'Loading map data…')
     setMapFeatures(map, seed)
 
     const bounds = emptyBounds()
@@ -249,6 +259,7 @@ export function MapPanel({
       dataset,
       source,
       snapshot,
+      traceId,
       thisRequest,
       requestId,
       fullBounds,
@@ -257,8 +268,15 @@ export function MapPanel({
         setFeatureCount(features.length)
         setProcessedRows(rowsRead)
         setStatus(
-          `Freezing… ${rowsRead.toLocaleString()} / ${snapshot.expectedRows.toLocaleString()} matching rows`,
+          `Loading geometries… ${rowsRead.toLocaleString()} / ${snapshot.expectedRows.toLocaleString()} rows`,
         )
+        onActivity?.({
+          type: 'progress',
+          traceId,
+          message: 'Loading geometries',
+          detail: `${features.length.toLocaleString()} features from ${rowsRead.toLocaleString()} rows`,
+          progress: Math.min(0.98, rowsRead / Math.max(1, snapshot.expectedRows)),
+        })
 
         // Painting the complete, ever-growing GeoJSON source after every small
         // Arrow batch becomes quadratic on very large snapshots. Paint the first
@@ -270,16 +288,39 @@ export function MapPanel({
           lastPaintedRows = rowsRead
         }
       },
-    ).then(({ features, rowsRead }) => {
+      diagnostic => onActivity?.({
+        type: 'progress',
+        traceId,
+        message: diagnostic.message,
+        detail: diagnostic.detail,
+        durationMs: diagnostic.durationMs,
+      }),
+    ).then(({ features, rowsRead, geometryDecodeMs }) => {
       if (thisRequest !== requestId.current) return
       featuresRef.current = features
       setMapFeatures(map, features)
       setFeatureCount(features.length)
       setProcessedRows(rowsRead)
-      setStatus('Frozen snapshot · pan and zoom do not re-query Parquet')
+      setStatus('Map ready · pan and zoom do not re-query the file')
+      onActivity?.({
+        type: 'progress',
+        traceId,
+        message: source.kind === 'geometry' ? 'Decoding WKB geometries total' : 'Building coordinate geometries total',
+        detail: `${features.length.toLocaleString()} geometries from ${rowsRead.toLocaleString()} rows`,
+        durationMs: geometryDecodeMs,
+      })
+      onActivity?.({
+        type: 'complete',
+        traceId,
+        message: 'Map ready',
+        detail: `${features.length.toLocaleString()} geometries loaded`,
+      })
       fitSnapshotBounds(map, fullBounds)
     }).catch(error => {
-      if (thisRequest === requestId.current) setStatus(String(error))
+      if (thisRequest === requestId.current) {
+        setStatus(String(error))
+        onActivity?.({ type: 'error', traceId, message: 'Map loading failed' })
+      }
     })
   }, [dataset.dataset_id, source, snapshot.id])
 
@@ -384,7 +425,7 @@ export function MapPanel({
           />
         )}
         <div className="map-status-card">
-          {featureCount.toLocaleString()} features · {processedRows.toLocaleString()} rows read · {status}
+          {featureCount.toLocaleString()} features · {processedRows.toLocaleString()} rows processed · {status}
         </div>
 
         {selectedIds.length > 0 && (
@@ -408,7 +449,7 @@ export function MapPanel({
       </div>
 
       <div className="map-note">
-        This map is a frozen snapshot of the filter state captured from the Data tab. Click any rendered geometry to inspect it, or enable Box select and drag over points, lines, polygons, or multipart features.
+        This map uses the filters from the Table tab. Pan and zoom are instant because the file is not queried again. Click a feature to inspect it, or use Box select to select an area.
       </div>
     </div>
   )
@@ -514,27 +555,37 @@ async function loadSnapshotFeatures(
   dataset: DatasetInfo,
   source: SpatialSource,
   snapshot: MapSnapshotSpec,
+  traceId: string,
   thisRequest: number,
   requestId: { current: number },
   bounds: BoundsAccumulator,
   onProgress: (features: Feature[], processedRows: number) => void,
-): Promise<{ features: Feature[]; rowsRead: number }> {
+  onDiagnostic: (event: { message: string; detail?: string; durationMs?: number }) => void,
+): Promise<{ features: Feature[]; rowsRead: number; geometryDecodeMs: number }> {
   const propertyColumns = selectMapPropertyColumns(dataset, source)
   const columns = [...spatialColumnNames(source), ...propertyColumns]
 
   const features: Feature[] = []
   let rowsRead = 0
+  let geometryDecodeMs = 0
 
   for await (
-    const batch of snapshotBatches(dataset.dataset_id, {
-      columns,
-      filters: snapshot.filters,
-    })
+    const batch of snapshotBatches(
+      dataset.dataset_id,
+      {
+        trace_id: traceId,
+        columns,
+        filters: snapshot.filters,
+      },
+      onDiagnostic,
+    )
   ) {
     if (thisRequest !== requestId.current) break
 
     const before = features.length
+    const geometryStarted = performance.now()
     appendSpatialBatchFeatures(batch, source, propertyColumns, features, rowsRead)
+    geometryDecodeMs += performance.now() - geometryStarted
     for (let index = before; index < features.length; index += 1) {
       extendBoundsWithGeometry(bounds, features[index].geometry)
     }
@@ -543,7 +594,12 @@ async function loadSnapshotFeatures(
     onProgress(features, rowsRead)
   }
 
-  return { features, rowsRead }
+  return { features, rowsRead, geometryDecodeMs }
+}
+
+function makeTraceId(prefix: string) {
+  const random = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  return `${prefix}-${random}`
 }
 
 function availableFeatureLayers(map: MapLibreMap): string[] {

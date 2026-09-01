@@ -1,11 +1,22 @@
+//! Core read-only dataset/query engine.
+//!
+//! A dataset handle stores lightweight metadata and a validated source URI.
+//! Individual queries create Parquet-RS readers against that URI, apply native
+//! projection/filter/row-group selection, and stream Arrow IPC to the browser.
+//! Physical-layout inspection lives in `engine::analysis`; request diagnostics
+//! live in `engine::trace` and object-store timing in `engine::source`.
+
+mod analysis;
 mod filter;
 mod ipc;
 mod source;
+mod trace;
 
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,53 +31,125 @@ use tempfile::{NamedTempFile, TempPath};
 use uuid::Uuid;
 
 use crate::model::{
-    Capabilities, ColumnInfo, CountRequest, DatasetEntry, DatasetInfo, ExportFormat, ExportRequest,
-    GeoColumnInfo, GeoParquetInfo, PageRequest, SnapshotRequest, SpatialRequest,
+    AnalysisRecommendationsResponse, AnalysisSummaryResponse, Capabilities, ColumnInfo,
+    ColumnsAnalysisResponse, CountRequest, DatasetEntry, DatasetInfo, ExportFormat, ExportRequest,
+    GeoColumnInfo, GeoParquetInfo, PageRequest, PagesAnalysisQuery, PagesAnalysisResponse,
+    QueryCostRequest, QueryCostResponse, RowGroupsAnalysisResponse, SnapshotRequest, SpatialRequest,
+    TraceSnapshot,
 };
 use filter::apply_filters;
 use ipc::{IpcByteStream, spawn_ipc_stream};
-use source::{ReaderBuilder, builder_for_uri};
+use source::{ReadMetrics, ReaderBuilder, builder_for_uri, builder_for_uri_with_metrics};
+use trace::{TraceReporter, TraceStore};
 
+/// Temporary file plus HTTP metadata returned by an export operation.
 pub struct ExportArtifact {
     pub path: TempPath,
     pub content_type: &'static str,
     pub filename: &'static str,
 }
 
+/// Shared native engine state.
+///
+/// Dataset handles are kept in memory and point at validated source URIs. The
+/// source data itself is never copied into this structure; each query performs
+/// ranged reads directly against the original Parquet object.
 pub struct CoreEngine {
     datasets: RwLock<HashMap<String, DatasetEntry>>,
     batch_size: usize,
     ipc_channel_capacity: usize,
     max_open_datasets: usize,
+    traces: TraceStore,
 }
 
 impl CoreEngine {
+    /// Construct an engine with a fixed Arrow batch size and handle limit.
     pub fn new(batch_size: usize, max_open_datasets: usize) -> Self {
         Self {
             datasets: RwLock::new(HashMap::new()),
             batch_size,
             ipc_channel_capacity: 4,
             max_open_datasets,
+            traces: TraceStore::default(),
         }
     }
 
-    pub async fn open_dataset(&self, uri: &str, name: Option<String>) -> Result<DatasetInfo> {
+    /// Validate that a Parquet source is readable, extract viewer metadata, and
+    /// register a lightweight in-memory dataset handle.
+    pub async fn open_dataset(
+        &self,
+        uri: &str,
+        name: Option<String>,
+        trace_id: Option<&str>,
+    ) -> Result<DatasetInfo> {
+        let trace = self.traces.reporter(trace_id);
         if self.datasets.read().len() >= self.max_open_datasets {
+            if let Some(trace) = &trace { trace.fail("Too many datasets are already open"); }
             bail!("maximum number of open dataset handles reached");
         }
 
-        let builder = builder_for_uri(uri).await?;
+        if let Some(trace) = &trace {
+            trace.event("query_parquet", "Querying Parquet metadata");
+        }
+        let builder = match builder_for_uri(uri).await {
+            Ok(builder) => builder,
+            Err(error) => {
+                if let Some(trace) = &trace { trace.fail("Could not read Parquet metadata"); }
+                return Err(error);
+            }
+        };
+        if let Some(trace) = &trace {
+            trace.event_with_detail(
+                "parquet_ready",
+                "Parquet exists and metadata is readable",
+                format!("{} row groups", builder.metadata().num_row_groups()),
+            );
+            trace.event("read_schema", "Reading schema and file statistics");
+        }
+
         let dataset_id = Uuid::new_v4().to_string();
         let info = build_dataset_info(&dataset_id, name, uri, &builder)?;
 
         let mut datasets = self.datasets.write();
         if datasets.len() >= self.max_open_datasets {
+            if let Some(trace) = &trace { trace.fail("Too many datasets are already open"); }
             bail!("maximum number of open dataset handles reached");
         }
         datasets.insert(dataset_id, DatasetEntry { info: info.clone() });
+        if let Some(trace) = &trace {
+            trace.finish_with_detail(
+                "Dataset ready",
+                format!("{} rows · {} columns", info.num_rows, info.columns.len()),
+            );
+        }
         Ok(info)
     }
 
+    /// Start a request trace when the caller supplied a non-empty trace ID.
+    pub fn start_trace(&self, trace_id: Option<&str>, operation: &str, message: &str) {
+        self.traces.start(trace_id, operation, message);
+    }
+
+    /// Append a milestone to an existing trace.
+    pub fn trace_event(&self, trace_id: Option<&str>, stage: &str, message: &str) {
+        if let Some(trace) = self.traces.reporter(trace_id) {
+            trace.event(stage, message);
+        }
+    }
+
+    /// Mark an existing trace as failed.
+    pub fn trace_fail(&self, trace_id: Option<&str>, message: &str) {
+        if let Some(trace) = self.traces.reporter(trace_id) {
+            trace.fail(message);
+        }
+    }
+
+    /// Return the current immutable diagnostics snapshot for polling clients.
+    pub fn trace_snapshot(&self, trace_id: &str) -> Option<TraceSnapshot> {
+        self.traces.snapshot(trace_id)
+    }
+
+    /// Return the lightweight metadata cached when the dataset was opened.
     pub fn metadata(&self, dataset_id: &str) -> Result<DatasetInfo> {
         self.datasets
             .read()
@@ -75,6 +158,66 @@ impl CoreEngine {
             .ok_or_else(|| anyhow!("dataset not found: {dataset_id}"))
     }
 
+    /// Return a cheap physical-layout summary derived from the Parquet footer.
+    ///
+    /// This does not read row data and never modifies the source object.
+    pub async fn analysis_summary(&self, dataset_id: &str) -> Result<AnalysisSummaryResponse> {
+        let entry = self.entry(dataset_id)?;
+        analysis::summary(
+            dataset_id,
+            &entry.info.uri,
+            entry.info.columns.len(),
+        )
+        .await
+    }
+
+    /// Aggregate storage, encoding, compression and statistics information for
+    /// each Parquet leaf column.
+    pub async fn analysis_columns(&self, dataset_id: &str) -> Result<ColumnsAnalysisResponse> {
+        let entry = self.entry(dataset_id)?;
+        analysis::columns(dataset_id, &entry.info.uri).await
+    }
+
+    /// Describe every row group and its column chunks from footer metadata.
+    pub async fn analysis_row_groups(&self, dataset_id: &str) -> Result<RowGroupsAnalysisResponse> {
+        let entry = self.entry(dataset_id)?;
+        analysis::row_groups(dataset_id, &entry.info.uri).await
+    }
+
+    /// Load optional Parquet page indexes and expose their page locations.
+    ///
+    /// This may issue small additional storage reads for page-index structures,
+    /// but it does not read the underlying data-page payloads.
+    pub async fn analysis_pages(
+        &self,
+        dataset_id: &str,
+        query: PagesAnalysisQuery,
+    ) -> Result<PagesAnalysisResponse> {
+        let entry = self.entry(dataset_id)?;
+        analysis::pages(dataset_id, &entry.info.uri, query).await
+    }
+
+    /// Estimate compressed bytes touched by a row query without executing it.
+    pub async fn analysis_query_cost(
+        &self,
+        dataset_id: &str,
+        request: QueryCostRequest,
+    ) -> Result<QueryCostResponse> {
+        let entry = self.entry(dataset_id)?;
+        analysis::query_cost(dataset_id, &entry.info.uri, request).await
+    }
+
+    /// Generate read-only observations about characteristics that can affect
+    /// interactive browser access. No rewrite or optimization is performed.
+    pub async fn analysis_recommendations(
+        &self,
+        dataset_id: &str,
+    ) -> Result<AnalysisRecommendationsResponse> {
+        let entry = self.entry(dataset_id)?;
+        analysis::recommendations(dataset_id, &entry.info.uri, &entry.info).await
+    }
+
+    /// Drop an in-memory dataset handle. The source Parquet object is untouched.
     pub fn close_dataset(&self, dataset_id: &str) -> Result<()> {
         if self.datasets.write().remove(dataset_id).is_none() {
             bail!("dataset not found: {dataset_id}");
@@ -82,29 +225,56 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// Stream the complete filtered snapshot requested by the map view.
     pub async fn snapshot_stream(
         &self,
         dataset_id: &str,
         req: SnapshotRequest,
     ) -> Result<IpcByteStream> {
+        let trace = self.traces.start(
+            req.trace_id.as_deref(),
+            "snapshot",
+            "Preparing map data",
+        );
         let entry = self.entry(dataset_id)?;
-        let builder = builder_for_uri(&entry.info.uri).await?;
+        if let Some(trace) = &trace { trace.event("dataset_found", "Dataset handle found"); }
+        let (builder, read_metrics) = builder_with_diagnostics(&entry.info.uri, trace.as_ref()).await?;
+        if let Some(trace) = &trace {
+            trace.event_with_detail(
+                "parquet_ready",
+                "Parquet metadata ready",
+                format!("{} row groups", builder.metadata().num_row_groups()),
+            );
+        }
         let builder = apply_filters(builder, &req.filters)?;
         let builder = apply_projection(builder, req.columns.as_deref())?
             .with_batch_size(self.batch_size);
+        if let Some(trace) = &trace { trace.event("reader_ready", "Reader plan ready"); }
         let stream = builder
             .build()
             .context("could not build filtered snapshot reader")?;
         let schema = Arc::clone(stream.schema());
-        Ok(spawn_ipc_stream(stream, schema, self.ipc_channel_capacity))
+        Ok(spawn_ipc_stream(
+            stream,
+            schema,
+            self.ipc_channel_capacity,
+            trace,
+            Some(read_metrics),
+        ))
     }
 
+    /// Count matching rows. Unfiltered counts use footer metadata; filtered
+    /// counts scan only the predicate columns plus one projected output column.
     pub async fn count_rows(&self, dataset_id: &str, req: CountRequest) -> Result<u64> {
+        let trace = self.traces.start(req.trace_id.as_deref(), "count", "Counting matching rows");
         let entry = self.entry(dataset_id)?;
         if req.filters.is_empty() {
-            return u64::try_from(entry.info.num_rows)
-                .context("dataset row count cannot be represented as u64");
+            let count = u64::try_from(entry.info.num_rows)
+                .context("dataset row count cannot be represented as u64")?;
+            if let Some(trace) = &trace { trace.finish_with_detail("Count ready", format!("{count} rows")); }
+            return Ok(count);
         }
+        if let Some(trace) = &trace { trace.event("query_parquet", "Opening Parquet for filtered count"); }
 
         let builder = builder_for_uri(&entry.info.uri).await?;
         let builder = apply_filters(builder, &req.filters)?;
@@ -131,13 +301,32 @@ impl CoreEngine {
                 .checked_add(batch.num_rows() as u64)
                 .ok_or_else(|| anyhow!("filtered row count overflow"))?;
         }
+        if let Some(trace) = &trace { trace.finish_with_detail("Count ready", format!("{total} rows")); }
         Ok(total)
     }
 
+    /// Stream a projected/filtered offset+limit row window as Arrow IPC.
     pub async fn page_stream(&self, dataset_id: &str, req: PageRequest) -> Result<IpcByteStream> {
+        let trace = self.traces.start(req.trace_id.as_deref(), "page", "Preparing data query");
         let entry = self.entry(dataset_id)?;
-        let builder = builder_for_uri(&entry.info.uri).await?;
+        if let Some(trace) = &trace { trace.event("dataset_found", "Dataset handle found"); }
+        let (builder, read_metrics) = builder_with_diagnostics(&entry.info.uri, trace.as_ref()).await?;
+        if let Some(trace) = &trace {
+            trace.event_with_detail(
+                "parquet_ready",
+                "Parquet metadata ready",
+                format!("{} row groups available", builder.metadata().num_row_groups()),
+            );
+        }
         let builder = apply_filters(builder, &req.filters)?;
+        if let Some(trace) = &trace {
+            let column_count = req.columns.as_ref().map_or(entry.info.columns.len(), Vec::len);
+            trace.event_with_detail(
+                "plan_query",
+                "Planning columns, filters, and row window",
+                format!("{} columns · offset {} · limit {} · {} filters", column_count, req.offset, req.limit, req.filters.len()),
+            );
+        }
         let builder = apply_projection(builder, req.columns.as_deref())?
             .with_offset(req.offset)
             .with_limit(req.limit)
@@ -145,17 +334,28 @@ impl CoreEngine {
         let stream = builder
             .build()
             .context("could not build Parquet page reader")?;
+        if let Some(trace) = &trace { trace.event("reader_ready", "Parquet reader ready"); }
         let schema = Arc::clone(stream.schema());
-        Ok(spawn_ipc_stream(stream, schema, self.ipc_channel_capacity))
+        Ok(spawn_ipc_stream(
+            stream,
+            schema,
+            self.ipc_channel_capacity,
+            trace,
+            Some(read_metrics),
+        ))
     }
 
+    /// Stream conservative spatial candidates selected using row-group bboxes.
+    /// Exact feature-level geometry filtering is intentionally not claimed here.
     pub async fn spatial_stream(
         &self,
         dataset_id: &str,
         mut req: SpatialRequest,
     ) -> Result<IpcByteStream> {
+        let trace = self.traces.start(req.trace_id.as_deref(), "spatial", "Preparing spatial query");
         validate_bbox(req.bbox)?;
         let entry = self.entry(dataset_id)?;
+        if let Some(trace) = &trace { trace.event("dataset_found", "Dataset handle found"); }
         let geometry = choose_geometry_column(&entry.info, req.geometry_column.as_deref())?;
         let requested = req.columns.take().map(|mut columns| {
             if !columns.iter().any(|name| name == &geometry) {
@@ -164,8 +364,17 @@ impl CoreEngine {
             columns
         });
 
-        let builder = builder_for_uri(&entry.info.uri).await?;
+        let (builder, read_metrics) = builder_with_diagnostics(&entry.info.uri, trace.as_ref()).await?;
+        let total_row_groups = builder.metadata().num_row_groups();
+        if let Some(trace) = &trace { trace.event("parquet_ready", "Parquet metadata ready"); }
         let row_groups = intersecting_row_groups(builder.metadata(), &geometry, req.bbox)?;
+        if let Some(trace) = &trace {
+            trace.event_with_detail(
+                "prune_row_groups",
+                "Pruning row groups with spatial statistics",
+                format!("{} of {} row groups selected", row_groups.len(), total_row_groups),
+            );
+        }
         let builder = apply_filters(builder, &req.filters)?;
         let builder = apply_projection(builder, requested.as_deref())?
             .with_row_groups(row_groups)
@@ -175,9 +384,16 @@ impl CoreEngine {
             .build()
             .context("could not build spatial Parquet reader")?;
         let schema = Arc::clone(stream.schema());
-        Ok(spawn_ipc_stream(stream, schema, self.ipc_channel_capacity))
+        Ok(spawn_ipc_stream(
+            stream,
+            schema,
+            self.ipc_channel_capacity,
+            trace,
+            Some(read_metrics),
+        ))
     }
 
+    /// Materialize a read-only subset into a temporary Arrow or Parquet export.
     pub async fn export(&self, dataset_id: &str, req: ExportRequest) -> Result<ExportArtifact> {
         if req.spatial_bbox.is_some() {
             bail!(
@@ -241,6 +457,71 @@ impl CoreEngine {
             .get(dataset_id)
             .cloned()
             .ok_or_else(|| anyhow!("dataset not found: {dataset_id}"))
+    }
+}
+
+async fn builder_with_diagnostics(
+    uri: &str,
+    trace: Option<&TraceReporter>,
+) -> Result<(ReaderBuilder, ReadMetrics)> {
+    if let Some(trace) = trace {
+        trace.event("query_parquet", "Reading Parquet footer and metadata");
+    }
+
+    let started = Instant::now();
+    let (builder, read_metrics) = builder_for_uri_with_metrics(uri).await?;
+    let total_ms = millis(started.elapsed());
+    let storage = read_metrics.snapshot();
+
+    if let Some(trace) = trace {
+        trace.event_with_duration(
+            "metadata_storage",
+            "Fetching Parquet metadata from storage",
+            storage.io_ms,
+            format!(
+                "{} object-store call{} · {} range{} · {} fetched",
+                storage.calls,
+                plural(storage.calls),
+                storage.ranges,
+                plural(storage.ranges),
+                format_bytes(storage.returned_bytes),
+            ),
+        );
+        trace.event_with_duration(
+            "metadata_decode",
+            "Parsing Parquet metadata",
+            total_ms.saturating_sub(storage.io_ms),
+            "Derived from metadata wall time minus measured storage wait",
+        );
+    }
+
+    // From this point onward the same reader metrics represent column/page data
+    // reads only, which lets the first-batch trace isolate remote storage wait.
+    read_metrics.reset();
+    Ok((builder, read_metrics))
+}
+
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn plural(value: u64) -> &'static str {
+    if value == 1 { "" } else { "s" }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.2} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.2} MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

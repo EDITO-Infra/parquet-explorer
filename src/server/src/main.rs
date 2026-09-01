@@ -1,3 +1,9 @@
+//! Server entry point and application wiring.
+//!
+//! `main` loads environment settings, constructs the shared native Parquet
+//! engine, mounts the versioned HTTP API, applies CORS/request tracing, and
+//! starts Axum with graceful shutdown handling.
+
 mod api;
 mod config;
 mod engine;

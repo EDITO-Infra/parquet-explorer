@@ -1,3 +1,9 @@
+//! Translation of API filter clauses into Parquet-RS `RowFilter` predicates.
+//!
+//! Filters are pushed into the native reader so predicate columns can be read
+//! separately from the output projection and non-matching rows are discarded
+//! before Arrow batches are returned to the browser.
+
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
@@ -23,6 +29,11 @@ use super::source::ReaderBuilder;
 /// predicates during decoding and applies the final output projection only
 /// after filtering, so a filter column does not need to be present in the
 /// table's requested columns.
+/// Compile API filter clauses into Parquet-RS row predicates.
+///
+/// The function validates referenced columns/types first and then attaches a
+/// `RowFilter` to the reader builder. No browser-side filtering is required for
+/// the supported operators.
 pub fn apply_filters(
     mut builder: ReaderBuilder,
     filters: &[FilterClause],

@@ -1,8 +1,16 @@
 import { RecordBatch, RecordBatchReader } from 'apache-arrow'
-import type { CountResponse, DatasetInfo, FilterClause, PageRequest, SnapshotRequest, SpatialRequest } from './types'
+import type { AnalysisRecommendationsResponse, AnalysisSummaryResponse, ColumnsAnalysisResponse, CountResponse, DatasetInfo, FilterClause, PageRequest, PagesAnalysisResponse, QueryCostRequest, QueryCostResponse, RowGroupsAnalysisResponse, SnapshotRequest, SpatialRequest, TraceSnapshot } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')
 const V1 = `${API_BASE}/api/v1`
+
+export interface ArrowDiagnosticEvent {
+  message: string
+  detail?: string
+  durationMs?: number
+}
+
+export type ArrowDiagnosticHandler = (event: ArrowDiagnosticEvent) => void
 
 async function expectOk(response: Response): Promise<Response> {
   if (response.ok) return response
@@ -15,11 +23,11 @@ async function expectOk(response: Response): Promise<Response> {
   throw new Error(text || `Request failed (${response.status})`)
 }
 
-export async function openDataset(uri: string, name?: string): Promise<DatasetInfo> {
+export async function openDataset(uri: string, name?: string, traceId?: string): Promise<DatasetInfo> {
   const response = await expectOk(await fetch(`${V1}/datasets/open`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ uri, name: name || undefined }),
+    body: JSON.stringify({ uri, name: name || undefined, trace_id: traceId }),
   }))
   return response.json() as Promise<DatasetInfo>
 }
@@ -33,51 +41,224 @@ export async function closeDataset(datasetId: string): Promise<void> {
   await expectOk(await fetch(`${V1}/datasets/${encodeURIComponent(datasetId)}`, { method: 'DELETE' }))
 }
 
-export async function* pageBatches(datasetId: string, request: PageRequest): AsyncGenerator<RecordBatch> {
-  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/page`, request)
+/** Cheap footer-derived physical-layout summary. */
+export async function getAnalysisSummary(datasetId: string): Promise<AnalysisSummaryResponse> {
+  const response = await expectOk(await fetch(`${V1}/datasets/${encodeURIComponent(datasetId)}/analysis/summary`))
+  return response.json() as Promise<AnalysisSummaryResponse>
 }
 
-export async function* snapshotBatches(datasetId: string, request: SnapshotRequest): AsyncGenerator<RecordBatch> {
-  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/snapshot`, request)
+/** Aggregate compressed storage and statistics coverage by Parquet leaf column. */
+export async function getColumnAnalysis(datasetId: string): Promise<ColumnsAnalysisResponse> {
+  const response = await expectOk(await fetch(`${V1}/datasets/${encodeURIComponent(datasetId)}/analysis/columns`))
+  return response.json() as Promise<ColumnsAnalysisResponse>
 }
 
-export async function countRows(datasetId: string, filters: FilterClause[] = []): Promise<number> {
+/** Inspect row groups and their physical column chunks without reading row data. */
+export async function getRowGroupAnalysis(datasetId: string): Promise<RowGroupsAnalysisResponse> {
+  const response = await expectOk(await fetch(`${V1}/datasets/${encodeURIComponent(datasetId)}/analysis/row-groups`))
+  return response.json() as Promise<RowGroupsAnalysisResponse>
+}
+
+/**
+ * Load optional Parquet page indexes. Passing rowGroup/column is recommended on
+ * large files to avoid returning a very large page-location response.
+ */
+export async function getPageAnalysis(
+  datasetId: string,
+  options: { rowGroup?: number; column?: string } = {},
+): Promise<PagesAnalysisResponse> {
+  const params = new URLSearchParams()
+  if (options.rowGroup !== undefined) params.set('row_group', String(options.rowGroup))
+  if (options.column) params.set('column', options.column)
+  const suffix = params.size > 0 ? `?${params.toString()}` : ''
+  const response = await expectOk(await fetch(`${V1}/datasets/${encodeURIComponent(datasetId)}/analysis/pages${suffix}`))
+  return response.json() as Promise<PagesAnalysisResponse>
+}
+
+/** Estimate compressed Parquet bytes touched by a page-like query without executing it. */
+export async function estimateQueryCost(datasetId: string, request: QueryCostRequest): Promise<QueryCostResponse> {
+  const response = await expectOk(await fetch(`${V1}/datasets/${encodeURIComponent(datasetId)}/analysis/query-cost`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+  }))
+  return response.json() as Promise<QueryCostResponse>
+}
+
+/** Read-only advisory findings; this viewer never rewrites or manages the source file. */
+export async function getAnalysisRecommendations(datasetId: string): Promise<AnalysisRecommendationsResponse> {
+  const response = await expectOk(await fetch(`${V1}/datasets/${encodeURIComponent(datasetId)}/analysis/recommendations`))
+  return response.json() as Promise<AnalysisRecommendationsResponse>
+}
+
+export async function* pageBatches(
+  datasetId: string,
+  request: PageRequest,
+  onDiagnostic?: ArrowDiagnosticHandler,
+): AsyncGenerator<RecordBatch> {
+  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/page`, request, onDiagnostic)
+}
+
+export async function* snapshotBatches(
+  datasetId: string,
+  request: SnapshotRequest,
+  onDiagnostic?: ArrowDiagnosticHandler,
+): AsyncGenerator<RecordBatch> {
+  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/snapshot`, request, onDiagnostic)
+}
+
+export async function countRows(datasetId: string, filters: FilterClause[] = [], traceId?: string): Promise<number> {
   const response = await expectOk(await fetch(`${V1}/datasets/${encodeURIComponent(datasetId)}/count`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ filters }),
+    body: JSON.stringify({ filters, trace_id: traceId }),
   }))
   const body = await response.json() as CountResponse
   return body.count
 }
 
-export async function* spatialBatches(datasetId: string, request: SpatialRequest): AsyncGenerator<RecordBatch> {
-  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/spatial`, request)
+export async function* spatialBatches(
+  datasetId: string,
+  request: SpatialRequest,
+  onDiagnostic?: ArrowDiagnosticHandler,
+): AsyncGenerator<RecordBatch> {
+  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/spatial`, request, onDiagnostic)
 }
 
-async function* arrowRequest(url: string, payload: unknown): AsyncGenerator<RecordBatch> {
+type TransportMetrics = {
+  bytes: number
+  chunks: number
+  readWaitMs: number
+  firstByteSeen: boolean
+}
+
+async function* arrowRequest(
+  url: string,
+  payload: unknown,
+  onDiagnostic?: ArrowDiagnosticHandler,
+): AsyncGenerator<RecordBatch> {
+  const requestStarted = performance.now()
   const response = await expectOk(await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
   }))
+  const headersAt = performance.now()
+  onDiagnostic?.({
+    message: 'Waiting for server response headers',
+    detail: 'Request start → HTTP headers received',
+    durationMs: headersAt - requestStarted,
+  })
+
   if (!response.body) throw new Error('Server returned an empty Arrow response')
 
-  const reader = await RecordBatchReader.from(streamBytes(response.body))
-  for await (const batch of reader) yield batch
+  const transport: TransportMetrics = {
+    bytes: 0,
+    chunks: 0,
+    readWaitMs: 0,
+    firstByteSeen: false,
+  }
+
+  const schemaStarted = performance.now()
+  const schemaWaitBefore = transport.readWaitMs
+  const reader = await RecordBatchReader.from(streamBytes(response.body, transport, headersAt, onDiagnostic))
+  const schemaWallMs = performance.now() - schemaStarted
+  const schemaReadWaitMs = Math.max(0, transport.readWaitMs - schemaWaitBefore)
+  onDiagnostic?.({
+    message: 'Decoding Arrow stream schema',
+    detail: 'Browser CPU estimate, excluding time waiting for response bytes',
+    durationMs: Math.max(0, schemaWallMs - schemaReadWaitMs),
+  })
+
+  const iterator = reader[Symbol.asyncIterator]()
+  let batchCount = 0
+  let rowCount = 0
+  let arrowCpuMs = Math.max(0, schemaWallMs - schemaReadWaitMs)
+
+  while (true) {
+    const bytesBefore = transport.bytes
+    const waitBefore = transport.readWaitMs
+    const nextStarted = performance.now()
+    const next = await iterator.next()
+    const wallMs = performance.now() - nextStarted
+    const waitMs = Math.max(0, transport.readWaitMs - waitBefore)
+    const cpuMs = Math.max(0, wallMs - waitMs)
+    arrowCpuMs += cpuMs
+
+    if (next.done) break
+
+    const batch = next.value
+    batchCount += 1
+    rowCount += batch.numRows
+
+    if (batchCount === 1) {
+      const bytesForBatch = Math.max(0, transport.bytes - bytesBefore)
+      onDiagnostic?.({
+        message: 'Waiting for first Arrow batch bytes',
+        detail: `${formatBytes(bytesForBatch)} received while the first batch became available`,
+        durationMs: waitMs,
+      })
+      onDiagnostic?.({
+        message: 'Decoding first Arrow batch',
+        detail: `${batch.numRows.toLocaleString()} rows · browser CPU estimate excluding response-byte wait`,
+        durationMs: cpuMs,
+      })
+    }
+
+    yield batch
+  }
+
+  onDiagnostic?.({
+    message: 'Arrow response bytes received',
+    detail: `${formatBytes(transport.bytes)} · ${transport.chunks.toLocaleString()} stream chunks`,
+    durationMs: transport.readWaitMs,
+  })
+  onDiagnostic?.({
+    message: 'Arrow IPC browser decoding total',
+    detail: `${rowCount.toLocaleString()} rows · ${batchCount.toLocaleString()} batches · derived browser CPU time`,
+    durationMs: arrowCpuMs,
+  })
 }
 
-async function* streamBytes(stream: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
+async function* streamBytes(
+  stream: ReadableStream<Uint8Array>,
+  metrics: TransportMetrics,
+  headersAt: number,
+  onDiagnostic?: ArrowDiagnosticHandler,
+): AsyncGenerator<Uint8Array> {
   const reader = stream.getReader()
   try {
     while (true) {
+      const readStarted = performance.now()
       const { value, done } = await reader.read()
+      metrics.readWaitMs += performance.now() - readStarted
       if (done) return
-      if (value) yield value
+      if (!value) continue
+
+      metrics.bytes += value.byteLength
+      metrics.chunks += 1
+      if (!metrics.firstByteSeen) {
+        metrics.firstByteSeen = true
+        onDiagnostic?.({
+          message: 'First response bytes reached the browser',
+          detail: `${formatBytes(value.byteLength)} in the first stream chunk`,
+          durationMs: performance.now() - headersAt,
+        })
+      }
+      yield value
     }
   } finally {
     reader.releaseLock()
   }
+}
+
+export async function getTrace(traceId: string): Promise<TraceSnapshot | null> {
+  const response = await fetch(`${V1}/diagnostics/${encodeURIComponent(traceId)}`, {
+    cache: 'no-store',
+  })
+  if (response.status === 404) return null
+  await expectOk(response)
+  return response.json() as Promise<TraceSnapshot>
 }
 
 export function exportUrl(datasetId: string): string {
@@ -99,4 +280,11 @@ export async function downloadSubset(datasetId: string, format: 'parquet' | 'arr
   anchor.download = filename
   anchor.click()
   URL.revokeObjectURL(href)
+}
+
+function formatBytes(bytes: number) {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GiB`
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(2)} MiB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`
+  return `${Math.round(bytes)} B`
 }

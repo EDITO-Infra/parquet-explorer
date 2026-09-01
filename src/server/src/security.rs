@@ -1,3 +1,9 @@
+//! Source-URI validation and SSRF protections.
+//!
+//! The viewer accepts user-provided Parquet URLs, so validating schemes, hosts,
+//! credentials, DNS results, and local-file policy is part of the security
+//! boundary before any object-store reader is created.
+
 use std::{net::{IpAddr, Ipv4Addr, Ipv6Addr}, path::Path};
 
 use anyhow::{Context, Result, bail};
@@ -6,6 +12,10 @@ use url::Url;
 
 use crate::config::Settings;
 
+/// Validate and normalize a user-supplied source URI before object-store access.
+///
+/// HTTP(S) hosts are DNS-resolved and checked against private/special-use
+/// address policy; local files are permitted only when explicitly configured.
 pub async fn validate_source_uri(input: &str, settings: &Settings) -> Result<String> {
     let mut url = Url::parse(input).context("source must be an absolute URL")?;
     let scheme = url.scheme().to_ascii_lowercase();

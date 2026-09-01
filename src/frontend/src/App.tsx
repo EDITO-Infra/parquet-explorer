@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Feature } from 'geojson'
 import { batchRows, type PlainRow } from './arrow'
-import { closeDataset, countRows, downloadSubset, openDataset, pageBatches } from './api'
+import { closeDataset, countRows, downloadSubset, getTrace, openDataset, pageBatches } from './api'
 import { ColumnPicker } from './ColumnPicker'
 import { DataTable } from './DataTable'
 import { FilterBar } from './FilterBar'
-import { MapPanel } from './MapPanel'
+import { MapPanel, type MapActivityUpdate } from './MapPanel'
+import { ProgressPanel, type ActivityState } from './ProgressPanel'
 import { detectSpatialSource } from './spatial'
 import { appendSpatialBatchFeatures, spatialColumnNames } from './spatialFeatures'
 import type { DatasetInfo, FilterClause, MapSnapshotSpec } from './types'
@@ -25,13 +26,16 @@ export default function App() {
   const [totalRows, setTotalRows] = useState<number | null>(null)
   const [countLoading, setCountLoading] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [opening, setOpening] = useState(false)
   const [error, setError] = useState('')
   const [theme, setTheme] = useState<Theme>(getInitialTheme)
   const [mapSnapshot, setMapSnapshot] = useState<MapSnapshotSpec | null>(null)
   const [mapPageFeatures, setMapPageFeatures] = useState<Feature[]>([])
   const [mapSnapshotSeed, setMapSnapshotSeed] = useState<Feature[]>([])
+  const [activity, setActivity] = useState<ActivityState | null>(null)
   const pageRequestId = useRef(0)
   const mapSnapshotId = useRef(0)
+  const activeTraceId = useRef<string | null>(null)
 
   const spatialSource = useMemo(
     () => dataset ? detectSpatialSource(dataset) : undefined,
@@ -42,6 +46,16 @@ export default function App() {
     document.documentElement.dataset.theme = theme
     window.localStorage.setItem('parquet-viewer-theme', theme)
   }, [theme])
+
+  useEffect(() => {
+    if (!activity || activity.status !== 'running') return
+    const timer = window.setInterval(() => {
+      setActivity(current => current?.status === 'running'
+        ? { ...current, elapsedMs: performance.now() - current.startedAt }
+        : current)
+    }, 100)
+    return () => window.clearInterval(timer)
+  }, [activity?.traceId, activity?.status])
 
   useEffect(() => {
     if (!dataset) return
@@ -68,11 +82,114 @@ export default function App() {
     return () => { cancelled = true }
   }, [dataset?.dataset_id, filters])
 
+  function beginActivity(traceId: string, title: string, current: string) {
+    activeTraceId.current = traceId
+    const startedAt = performance.now()
+    setActivity({
+      traceId,
+      title,
+      current,
+      status: 'running',
+      startedAt,
+      elapsedMs: 0,
+      clientEvents: [],
+    })
+    void monitorTrace(traceId)
+  }
+
+  function addClientActivity(
+    traceId: string,
+    message: string,
+    detail?: string,
+    progress?: number,
+    durationMs?: number,
+  ) {
+    setActivity(current => {
+      if (!current || current.traceId !== traceId) return current
+      const elapsedMs = performance.now() - current.startedAt
+      return {
+        ...current,
+        current: message,
+        progress: progress ?? current.progress,
+        elapsedMs,
+        clientEvents: [...current.clientEvents, {
+          message,
+          detail,
+          elapsedMs,
+          durationMs,
+          source: 'Browser',
+        }],
+      }
+    })
+  }
+
+  function finishActivity(traceId: string, message: string, detail?: string) {
+    setActivity(current => {
+      if (!current || current.traceId !== traceId) return current
+      const elapsedMs = performance.now() - current.startedAt
+      return {
+        ...current,
+        current: message,
+        status: 'complete',
+        progress: 1,
+        elapsedMs,
+        clientEvents: [...current.clientEvents, {
+          message,
+          detail,
+          elapsedMs,
+          source: 'Browser',
+        }],
+      }
+    })
+  }
+
+  function failActivity(traceId: string, message: string) {
+    setActivity(current => {
+      if (!current || current.traceId !== traceId) return current
+      return {
+        ...current,
+        current: message,
+        status: 'error',
+        elapsedMs: performance.now() - current.startedAt,
+      }
+    })
+  }
+
+  async function monitorTrace(traceId: string) {
+    let seen = false
+    for (let attempt = 0; attempt < 900; attempt += 1) {
+      if (activeTraceId.current !== traceId) return
+      try {
+        const trace = await getTrace(traceId)
+        if (trace) {
+          seen = true
+          setActivity(current => {
+            if (!current || current.traceId !== traceId) return current
+            const last = trace.events.at(-1)
+            return {
+              ...current,
+              trace,
+              current: trace.status === 'running' && last ? last.message : current.current,
+              elapsedMs: Math.max(current.elapsedMs, trace.elapsed_ms),
+            }
+          })
+          if (trace.status !== 'running') return
+        }
+      } catch {
+        // Diagnostics must never interrupt the actual query.
+      }
+      if (!seen && attempt >= 40) return
+      await delay(120)
+    }
+  }
+
   async function onOpen(event: React.FormEvent) {
     event.preventDefault()
     if (!uri.trim()) return
 
-    setLoading(true)
+    const traceId = makeTraceId('open')
+    beginActivity(traceId, 'Opening file', 'Checking source')
+    setOpening(true)
     setError('')
 
     try {
@@ -80,7 +197,8 @@ export default function App() {
         await closeDataset(dataset.dataset_id).catch(() => undefined)
       }
 
-      const info = await openDataset(uri.trim())
+      const info = await openDataset(uri.trim(), undefined, traceId)
+      addClientActivity(traceId, 'Preparing the viewer', `${info.columns.length} fields found`)
 
       setDataset(info)
       setOffset(0)
@@ -92,10 +210,12 @@ export default function App() {
       setMapPageFeatures([])
       setMapSnapshotSeed([])
       setTab('data')
+      finishActivity(traceId, 'File opened', `${info.num_rows.toLocaleString()} rows ready to explore`)
     } catch (err) {
+      failActivity(traceId, 'Could not open file')
       setError(String(err))
     } finally {
-      setLoading(false)
+      setOpening(false)
     }
   }
 
@@ -106,11 +226,11 @@ export default function App() {
     pageColumns: string[],
   ) {
     const requestId = ++pageRequestId.current
+    const traceId = makeTraceId('page')
 
     const pageSpatialSource = detectSpatialSource(info)
-    // Numeric coordinate pairs are cheap enough to keep with the table page so
-    // Switch to map can paint those rows immediately. Large WKB geometry stays
-    // out of the table projection unless the user already chose to display it.
+    // Keep coordinate pairs available for a fast map preview. Large WKB geometry
+    // stays out of the table projection unless it is already visible.
     const requiredSpatialColumns = pageSpatialSource?.kind === 'coordinates'
       ? spatialColumnNames(pageSpatialSource)
       : pageSpatialSource && pageColumns.includes(pageSpatialSource.geometry.name)
@@ -125,6 +245,7 @@ export default function App() {
       return
     }
 
+    beginActivity(traceId, 'Loading rows', `Fetching rows ${(pageOffset + 1).toLocaleString()}–${(pageOffset + pageLimit).toLocaleString()}`)
     setLoading(true)
     setError('')
 
@@ -136,15 +257,37 @@ export default function App() {
       const mapPropertyColumns = pageColumns.filter(name => !spatialSet.has(name)).slice(0, 8)
 
       for await (
-        const batch of pageBatches(info.dataset_id, {
-          columns: requestColumns,
-          offset: pageOffset,
-          limit: pageLimit,
-          filters,
-        })
+        const batch of pageBatches(
+          info.dataset_id,
+          {
+            trace_id: traceId,
+            columns: requestColumns,
+            offset: pageOffset,
+            limit: pageLimit,
+            filters,
+          },
+          diagnostic => addClientActivity(
+            traceId,
+            diagnostic.message,
+            diagnostic.detail,
+            undefined,
+            diagnostic.durationMs,
+          ),
+        )
       ) {
+        const tableDecodeStarted = performance.now()
         nextRows.push(...batchRows(batch, pageLimit - nextRows.length))
+        addClientActivity(
+          traceId,
+          'Building table rows',
+          `${Math.min(pageLimit, rowsRead + batch.numRows).toLocaleString()} of ${pageLimit.toLocaleString()} requested`,
+          Math.min(0.94, (rowsRead + batch.numRows) / Math.max(1, pageLimit)),
+          performance.now() - tableDecodeStarted,
+        )
+
         if (pageSpatialSource) {
+          const featureCountBefore = nextMapFeatures.length
+          const geometryStarted = performance.now()
           appendSpatialBatchFeatures(
             batch,
             pageSpatialSource,
@@ -152,18 +295,40 @@ export default function App() {
             nextMapFeatures,
             pageOffset + rowsRead,
           )
+          addClientActivity(
+            traceId,
+            pageSpatialSource.kind === 'geometry' ? 'Decoding WKB geometries' : 'Building coordinate geometries',
+            `${(nextMapFeatures.length - featureCountBefore).toLocaleString()} features from ${batch.numRows.toLocaleString()} rows`,
+            Math.min(0.98, (rowsRead + batch.numRows) / Math.max(1, pageLimit)),
+            performance.now() - geometryStarted,
+          )
         }
         rowsRead += batch.numRows
         if (nextRows.length >= pageLimit) break
       }
 
+      if (pageSpatialSource && nextMapFeatures.length > 0) {
+        addClientActivity(
+          traceId,
+          'Preparing map preview',
+          `${nextMapFeatures.length.toLocaleString()} geometries ready`,
+          0.98,
+        )
+      }
+
       if (requestId === pageRequestId.current) {
         setRows(nextRows)
         setMapPageFeatures(nextMapFeatures)
+        finishActivity(
+          traceId,
+          'Rows ready',
+          `${nextRows.length.toLocaleString()} rows loaded into the table`,
+        )
       }
     } catch (err) {
       if (requestId === pageRequestId.current) {
         setMapPageFeatures([])
+        failActivity(traceId, 'Loading rows failed')
         setError(String(err))
       }
     } finally {
@@ -183,16 +348,36 @@ export default function App() {
     setTab('map')
   }
 
+  function handleMapActivity(update: MapActivityUpdate) {
+    if (update.type === 'start') {
+      beginActivity(update.traceId, 'Loading map', update.message)
+      return
+    }
+    if (update.type === 'progress') {
+      addClientActivity(update.traceId, update.message, update.detail, update.progress, update.durationMs)
+      return
+    }
+    if (update.type === 'complete') {
+      finishActivity(update.traceId, update.message, update.detail)
+      return
+    }
+    failActivity(update.traceId, update.message)
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
-          <h1>Parquet Viewer</h1>
+        <div className="brand-block">
+          <div className="brand-mark" aria-hidden="true">P</div>
+          <div>
+            <h1>Parquet Viewer</h1>
+            <p>Open, inspect, filter and map Parquet files.</p>
+          </div>
         </div>
         <div className="topbar-actions">
           {dataset && (
-            <div className="dataset-pill">
-              {dataset.num_rows.toLocaleString()} rows · {dataset.num_row_groups} row groups
+            <div className="dataset-pill" title={dataset.uri}>
+              {dataset.name || filename(dataset.uri)}
             </div>
           )}
           <button
@@ -209,77 +394,87 @@ export default function App() {
       </header>
 
       <form className="open-bar" onSubmit={onOpen}>
-        <input
-          value={uri}
-          onChange={event => setUri(event.target.value)}
-          placeholder="https://…/dataset.parquet"
-          aria-label="Parquet URL"
-        />
-        <button disabled={loading || !uri.trim()}>
-          {loading ? 'Working…' : 'Open Parquet'}
+        <div className="open-input-wrap">
+          <span className="open-input-label">Parquet URL</span>
+          <input
+            value={uri}
+            onChange={event => setUri(event.target.value)}
+            placeholder="https://example.com/data.parquet"
+            aria-label="Parquet URL"
+          />
+        </div>
+        <button disabled={opening || !uri.trim()}>
+          {opening ? 'Opening…' : 'Open file'}
         </button>
       </form>
 
       {error && <div className="error-banner">{error}</div>}
+      <ProgressPanel activity={activity} />
 
       {!dataset ? (
         <main className="landing">
           <div className="landing-card">
             <span className="eyebrow">Parquet + GeoParquet</span>
-            <h2>Paste a Parquet URL.</h2>
+            <h2>Explore a Parquet file without downloading it first.</h2>
             <p>
-              The Rust backend range-reads Parquet. Table data arrives as Arrow IPC;
-              coordinate pairs and geometry columns can be explored on an interactive map or globe.
+              Paste a file URL to preview rows, filter values, inspect the schema,
+              and map spatial data when it is available.
             </p>
+            <div className="landing-features" aria-label="Viewer features">
+              <span>Preview rows</span>
+              <span>Filter data</span>
+              <span>Inspect fields</span>
+              <span>Map geometry</span>
+            </div>
           </div>
         </main>
       ) : (
         <main className="workspace">
           <aside className="sidebar">
-            <div className="side-section">
-              <span className="section-label">Dataset</span>
+            <div className="side-section dataset-summary">
+              <span className="section-label">Current file</span>
               <div className="uri" title={dataset.uri}>
                 {dataset.name || filename(dataset.uri)}
               </div>
-              <div className="muted mono">{dataset.dataset_id.slice(0, 12)}</div>
+              <div className="muted source-uri" title={dataset.uri}>{dataset.uri}</div>
             </div>
 
-            <div className="side-section stats-grid">
-              <Metric label="Rows" value={dataset.num_rows.toLocaleString()} />
-              <Metric label="Columns" value={String(dataset.columns.length)} />
-              <Metric label="Row groups" value={String(dataset.num_row_groups)} />
-              <Metric
-                label="Spatial"
-                value={spatialSource ? spatialSource.kind : 'none'}
-              />
-            </div>
-
-            {spatialSource && (
-              <div className="side-section">
-                <span className="section-label">Spatial source</span>
-                {spatialSource.kind === 'coordinates' ? (
-                  <dl className="metadata-list">
-                    <dt>Type</dt><dd>Coordinates</dd>
-                    <dt>Longitude</dt><dd>{spatialSource.longitude}</dd>
-                    <dt>Latitude</dt><dd>{spatialSource.latitude}</dd>
-                  </dl>
-                ) : (
-                  <dl className="metadata-list">
-                    <dt>Column</dt><dd>{spatialSource.geometry.name}</dd>
-                    <dt>Type</dt><dd>{spatialSource.geometry.logical_type}</dd>
-                    <dt>CRS</dt><dd>{spatialSource.geometry.crs}</dd>
-                    <dt>Statistics</dt>
-                    <dd>
-                      {spatialSource.geometry.row_groups_with_bbox}/
-                      {spatialSource.geometry.row_groups_total}
-                    </dd>
-                  </dl>
-                )}
+            <details className="side-section file-details">
+              <summary>File details</summary>
+              <div className="stats-grid compact-stats">
+                <Metric label="Rows" value={dataset.num_rows.toLocaleString()} />
+                <Metric label="Fields" value={String(dataset.columns.length)} />
+                <Metric label="Row groups" value={String(dataset.num_row_groups)} />
+                <Metric label="Spatial" value={spatialSource ? 'Yes' : 'No'} />
               </div>
-            )}
+
+              {spatialSource && (
+                <div className="spatial-details">
+                  <span className="section-label">Spatial data</span>
+                  {spatialSource.kind === 'coordinates' ? (
+                    <dl className="metadata-list">
+                      <dt>Type</dt><dd>Coordinates</dd>
+                      <dt>Longitude</dt><dd>{spatialSource.longitude}</dd>
+                      <dt>Latitude</dt><dd>{spatialSource.latitude}</dd>
+                    </dl>
+                  ) : (
+                    <dl className="metadata-list">
+                      <dt>Field</dt><dd>{spatialSource.geometry.name}</dd>
+                      <dt>Type</dt><dd>{spatialSource.geometry.logical_type}</dd>
+                      <dt>CRS</dt><dd>{spatialSource.geometry.crs}</dd>
+                      <dt>Bbox stats</dt>
+                      <dd>
+                        {spatialSource.geometry.row_groups_with_bbox}/
+                        {spatialSource.geometry.row_groups_total} row groups
+                      </dd>
+                    </dl>
+                  )}
+                </div>
+              )}
+            </details>
 
             <div className="side-section">
-              <span className="section-label">Export</span>
+              <span className="section-label">Download</span>
               <div className="button-stack">
                 <button
                   className="secondary"
@@ -290,7 +485,7 @@ export default function App() {
                     filters,
                   )}
                 >
-                  Download Parquet
+                  Save as Parquet
                 </button>
                 <button
                   className="secondary"
@@ -301,7 +496,7 @@ export default function App() {
                     filters,
                   )}
                 >
-                  Download Arrow
+                  Save as Arrow
                 </button>
               </div>
             </div>
@@ -310,7 +505,7 @@ export default function App() {
           <section className="content">
             <nav className="tabs">
               <TabButton active={tab === 'data'} onClick={() => setTab('data')}>
-                Data
+                Table
               </TabButton>
               <TabButton
                 active={tab === 'map'}
@@ -320,7 +515,7 @@ export default function App() {
                 Map
               </TabButton>
               <TabButton active={tab === 'schema'} onClick={() => setTab('schema')}>
-                Schema
+                Schema &amp; stats
               </TabButton>
             </nav>
 
@@ -372,13 +567,13 @@ export default function App() {
                         className="map-switch-button"
                         disabled={loading || countLoading || totalRows == null}
                         onClick={switchToMap}
-                        title="Freeze the current filtered result and render the complete spatial selection on the map"
+                        title="Create a map from the current filtered result"
                       >
                         {countLoading
                           ? 'Counting…'
                           : mapSnapshot && sameFilters(mapSnapshot.filters, filters)
-                            ? 'Refresh map snapshot'
-                            : 'Switch to map'}
+                            ? 'Refresh map'
+                            : 'View on map'}
                       </button>
                     )}
                     <ColumnPicker
@@ -391,7 +586,7 @@ export default function App() {
                       }}
                     />
                     <label>
-                      Rows/page{' '}
+                      Rows per page{' '}
                       <select
                         value={limit}
                         disabled={loading}
@@ -425,59 +620,64 @@ export default function App() {
                   seedFeatures={mapSnapshotSeed}
                   theme={theme}
                   active={tab === 'map'}
+                  onActivity={handleMapActivity}
                 />
               </section>
             )}
 
             {tab === 'schema' && (
               <section className="pane schema-pane">
-                <div className="schema-summary">
+                <div className="schema-intro">
                   <div>
-                    <span className="section-label">GeoParquet</span>
-                    <strong>
-                      {dataset.geo_parquet?.version ?? 'native geospatial Parquet / none'}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="section-label">V2 checks</span>
-                    <strong>
-                      {dataset.geo_parquet?.v2_metadata_checks_passed
-                        ? 'Passed'
-                        : 'Not confirmed'}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="section-label">Exact spatial</span>
-                    <strong>
-                      {dataset.capabilities.spatial_exact
-                        ? 'Enabled'
-                        : 'Geometry path not exact'}
-                    </strong>
+                    <span className="eyebrow">File overview</span>
+                    <h2>Schema &amp; statistics</h2>
+                    <p>Structure, storage layout, and spatial metadata for this file.</p>
                   </div>
                 </div>
 
+                <div className="schema-summary schema-stats">
+                  <StatCard label="Rows" value={dataset.num_rows.toLocaleString()} help="Total rows reported by the file metadata" />
+                  <StatCard label="Fields" value={String(dataset.columns.length)} help="Columns available to query" />
+                  <StatCard label="Row groups" value={String(dataset.num_row_groups)} help="Parquet storage groups used for reads" />
+                  <StatCard label="Spatial" value={spatialSource ? 'Available' : 'Not detected'} help={spatialSource ? 'Map view can be created' : 'No geometry or coordinate pair detected'} />
+                </div>
+
+                {dataset.geo_parquet && (
+                  <div className="schema-summary technical-stats">
+                    <StatCard label="GeoParquet" value={dataset.geo_parquet.version} help={`Primary field: ${dataset.geo_parquet.primary_column}`} />
+                    <StatCard label="Metadata checks" value={dataset.geo_parquet.v2_metadata_checks_passed ? 'Passed' : 'Review'} help="GeoParquet metadata validation" />
+                    <StatCard label="Exact spatial filter" value={dataset.capabilities.spatial_exact ? 'Enabled' : 'Not yet'} help="Current map query capability" />
+                  </div>
+                )}
+
                 {dataset.geo_parquet?.warnings.length ? (
                   <div className="warning-box">
-                    <strong>Metadata warnings</strong>
+                    <strong>Metadata notes</strong>
                     {dataset.geo_parquet.warnings.map(warning => (
                       <div key={warning}>{warning}</div>
                     ))}
                   </div>
                 ) : null}
 
+                <div className="schema-section-head">
+                  <div>
+                    <h3>Fields</h3>
+                    <p>The logical and physical representation of each column.</p>
+                  </div>
+                </div>
                 <div className="schema-table">
                   <div className="schema-row schema-head">
-                    <span>Name</span>
-                    <span>Arrow type</span>
-                    <span>Parquet physical</span>
-                    <span>Nullable</span>
+                    <span>Field</span>
+                    <span>Data type</span>
+                    <span>Parquet storage</span>
+                    <span>Optional</span>
                   </div>
                   {dataset.columns.map(column => (
                     <div className="schema-row" key={column.name}>
                       <span>{column.name}</span>
                       <span className="mono">{column.arrow_type}</span>
                       <span>{column.parquet_physical_type ?? '—'}</span>
-                      <span>{column.nullable ? 'yes' : 'no'}</span>
+                      <span>{column.nullable ? 'Yes' : 'No'}</span>
                     </div>
                   ))}
                 </div>
@@ -521,6 +721,16 @@ function Metric({ label, value }: { label: string; value: string }) {
   )
 }
 
+function StatCard({ label, value, help }: { label: string; value: string; help: string }) {
+  return (
+    <div className="stat-card">
+      <span className="section-label">{label}</span>
+      <strong>{value}</strong>
+      <p>{help}</p>
+    </div>
+  )
+}
+
 function getInitialTheme(): Theme {
   const saved = window.localStorage.getItem('parquet-viewer-theme')
   if (saved === 'light' || saved === 'dark') return saved
@@ -537,4 +747,13 @@ function filename(uri: string) {
   } catch {
     return uri
   }
+}
+
+function makeTraceId(prefix: string) {
+  const random = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  return `${prefix}-${random}`
+}
+
+function delay(ms: number) {
+  return new Promise(resolve => window.setTimeout(resolve, ms))
 }
