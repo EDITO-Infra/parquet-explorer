@@ -7,13 +7,12 @@
 use std::{io, sync::Arc};
 
 use axum::{
-    Json,
+    Json, Router,
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::Response,
     routing::{delete, get, post},
-    Router,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -24,9 +23,10 @@ use crate::{
     error::ApiError,
     model::{
         AnalysisRecommendationsResponse, AnalysisSummaryResponse, ColumnsAnalysisResponse,
-        CountRequest, CountResponse, DatasetInfo, DatasetOpenRequest, ExportRequest, HealthResponse,
-        PageRequest, PagesAnalysisQuery, PagesAnalysisResponse, QueryCostRequest, QueryCostResponse,
-        RowGroupsAnalysisResponse, SchemaResponse, SnapshotRequest, SpatialRequest,
+        CountRequest, CountResponse, DatasetInfo, DatasetOpenRequest, ExportRequest,
+        HealthResponse, PageRequest, PagesAnalysisQuery, PagesAnalysisResponse, QueryCostRequest,
+        QueryCostResponse, RowGroupsAnalysisResponse, SchemaResponse, SnapshotRequest,
+        SpatialRequest,
     },
     security::validate_source_uri,
 };
@@ -41,12 +41,27 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/datasets/{dataset_id}/schema", get(schema))
         // Read-only physical-layout analysis. These routes describe the source
         // file; they never rewrite, move, upload, or otherwise manage it.
-        .route("/datasets/{dataset_id}/analysis/summary", get(analysis_summary))
-        .route("/datasets/{dataset_id}/analysis/columns", get(analysis_columns))
-        .route("/datasets/{dataset_id}/analysis/row-groups", get(analysis_row_groups))
+        .route(
+            "/datasets/{dataset_id}/analysis/summary",
+            get(analysis_summary),
+        )
+        .route(
+            "/datasets/{dataset_id}/analysis/columns",
+            get(analysis_columns),
+        )
+        .route(
+            "/datasets/{dataset_id}/analysis/row-groups",
+            get(analysis_row_groups),
+        )
         .route("/datasets/{dataset_id}/analysis/pages", get(analysis_pages))
-        .route("/datasets/{dataset_id}/analysis/query-cost", post(analysis_query_cost))
-        .route("/datasets/{dataset_id}/analysis/recommendations", get(analysis_recommendations))
+        .route(
+            "/datasets/{dataset_id}/analysis/query-cost",
+            post(analysis_query_cost),
+        )
+        .route(
+            "/datasets/{dataset_id}/analysis/recommendations",
+            get(analysis_recommendations),
+        )
         .route("/datasets/{dataset_id}/page", post(page))
         .route("/datasets/{dataset_id}/count", post(count))
         .route("/datasets/{dataset_id}/snapshot", post(snapshot))
@@ -60,7 +75,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        native_engine: format!("parquet-viewer-server/{}", env!("CARGO_PKG_VERSION")),
+        native_engine: format!("parquet-viewer-backend/{}", env!("CARGO_PKG_VERSION")),
     })
 }
 
@@ -76,15 +91,23 @@ async fn open_dataset(
     }
 
     let trace_id = payload.trace_id.clone();
-    state.engine.start_trace(trace_id.as_deref(), "open", "Checking source URL");
+    state
+        .engine
+        .start_trace(trace_id.as_deref(), "open", "Checking source URL");
     let uri = match validate_source_uri(&payload.uri, &state.settings).await {
         Ok(uri) => uri,
         Err(error) => {
-            state.engine.trace_fail(trace_id.as_deref(), "Source URL was rejected");
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Source URL was rejected");
             return Err(ApiError::bad_request(format!("{error:#}")));
         }
     };
-    state.engine.trace_event(trace_id.as_deref(), "source_validated", "Source URL accepted");
+    state.engine.trace_event(
+        trace_id.as_deref(),
+        "source_validated",
+        "Source URL accepted",
+    );
     let info = state
         .engine
         .open_dataset(&uri, payload.name, trace_id.as_deref())
@@ -208,7 +231,7 @@ async fn analysis_recommendations(
 async fn page(
     State(state): State<Arc<AppState>>,
     Path(dataset_id): Path<String>,
-    Json(mut payload): Json<PageRequest>,
+    Json(payload): Json<PageRequest>,
 ) -> Result<Response, ApiError> {
     if !payload.sort.is_empty() {
         return Err(ApiError::not_implemented(
@@ -229,7 +252,9 @@ async fn page(
     let stream = match state.engine.page_stream(&dataset_id, payload).await {
         Ok(stream) => stream,
         Err(error) => {
-            state.engine.trace_fail(trace_id.as_deref(), "Data query failed");
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Data query failed");
             return Err(ApiError::from_engine(error));
         }
     };
@@ -246,7 +271,9 @@ async fn snapshot(
     let stream = match state.engine.snapshot_stream(&dataset_id, payload).await {
         Ok(stream) => stream,
         Err(error) => {
-            state.engine.trace_fail(trace_id.as_deref(), "Map data query failed");
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Map data query failed");
             return Err(ApiError::from_engine(error));
         }
     };
@@ -263,7 +290,9 @@ async fn count(
     let count = match state.engine.count_rows(&dataset_id, payload).await {
         Ok(count) => count,
         Err(error) => {
-            state.engine.trace_fail(trace_id.as_deref(), "Count query failed");
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Count query failed");
             return Err(ApiError::from_engine(error));
         }
     };
@@ -286,7 +315,9 @@ async fn spatial(
     let stream = match state.engine.spatial_stream(&dataset_id, payload).await {
         Ok(stream) => stream,
         Err(error) => {
-            state.engine.trace_fail(trace_id.as_deref(), "Spatial query failed");
+            state
+                .engine
+                .trace_fail(trace_id.as_deref(), "Spatial query failed");
             return Err(ApiError::from_engine(error));
         }
     };
@@ -326,16 +357,14 @@ async fn export(
     // Hold TempPath inside the stream state. It deletes the temporary export as
     // soon as the HTTP body reaches EOF or is dropped after a disconnect.
     let reader = ReaderStream::new(file);
-    let guarded_stream = stream::unfold(
-        (reader, artifact.path),
-        |(mut reader, guard)| async move {
+    let guarded_stream =
+        stream::unfold((reader, artifact.path), |(mut reader, guard)| async move {
             match reader.next().await {
                 Some(Ok(bytes)) => Some((Ok::<Bytes, io::Error>(bytes), (reader, guard))),
                 Some(Err(error)) => Some((Err(error), (reader, guard))),
                 None => None,
             }
-        },
-    );
+        });
 
     let mut response = Response::new(Body::from_stream(guarded_stream));
     *response.status_mut() = StatusCode::OK;
@@ -406,4 +435,3 @@ where
     }
     response
 }
-

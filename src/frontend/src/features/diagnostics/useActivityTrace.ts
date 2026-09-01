@@ -3,7 +3,7 @@
  *
  * App and feature components report high-level browser stages through the
  * methods returned here. The hook also polls the backend trace endpoint and
- * merges those server events into the same ActivityState consumed by
+ * merges those events into the same ActivityState consumed by
  * ProgressPanel.
  *
  * Keeping this orchestration here prevents every feature from implementing its

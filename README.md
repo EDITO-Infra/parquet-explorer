@@ -19,6 +19,15 @@ Rust API
 
 The viewer does not download or manage source files as application state. It opens remote HTTP(S) Parquet sources through temporary backend handles and reads the required byte ranges on demand.
 
+## Authorship and funding
+
+Parquet Viewer is developed at the (**Flanders Marine Institute (VLIZ)**)(https://www.vliz.be/) as a part of the (**European Digital Twin Ocean (EDTO)**)[https://www.edito.eu/], a Horizon Europe project supporting the continued development of the European Digital Twin Ocean.
+
+This work is funded by the European Union under **grant agreement No. 101227771**.
+
+
+> Views and opinions expressed are those of the author(s) only and do not necessarily reflect those of the European Union or the granting authority. Neither the European Union nor the granting authority can be held responsible for them.
+
 ## Documentation
 
 Start with [`docs/index.md`](docs/index.md). The docs intentionally focus on stable project behavior and boundaries; planned features are marked TODO until implemented.
@@ -122,7 +131,7 @@ make build-frontend
 ## Repository layout
 
 ```text
-src/server/       Rust API + Parquet/Arrow engine
+src/backend/       Rust API + Parquet/Arrow engine
 src/frontend/     React + Arrow JS + MapLibre frontend
 docs/             developer documentation
 deploy/           reverse-proxy configuration
@@ -131,6 +140,16 @@ deploy/           reverse-proxy configuration
 ## Security
 
 A server that fetches user-provided URLs is an SSRF boundary. The application validates source URLs and rejects private/special-use targets by default. Production deployments should also enforce appropriate network-level egress restrictions.
+
+## Test dataset
+
+A public dataset useful for local development and performance testing:
+
+```text
+https://s3.waw3-1.cloudferro.com/emodnet/emodnet_biology/12639/marine_biodiversity_observations_occurrence_2026-08-19.parquet
+```
+
+`IMISDatasetId: 9064`
 
 ## Validation
 

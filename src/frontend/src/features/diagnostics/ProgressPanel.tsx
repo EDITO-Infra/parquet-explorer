@@ -30,7 +30,7 @@ export interface ActivityState {
 export function ProgressPanel({ activity }: { activity: ActivityState | null }) {
   if (!activity) return null
 
-  const serverEvents: ActivityEvent[] = activity.trace?.events.map(event => ({
+  const backendEvents: ActivityEvent[] = activity.trace?.events.map(event => ({
     message: event.message,
     detail: event.detail ?? undefined,
     elapsedMs: event.elapsed_ms,
@@ -63,7 +63,7 @@ export function ProgressPanel({ activity }: { activity: ActivityState | null }) 
       <details className="activity-details">
         <summary>Query details &amp; timings</summary>
         <div className="activity-timeline-wrap">
-          <Timeline title="Backend" events={serverEvents} />
+          <Timeline title="Backend" events={backendEvents} />
           <Timeline title="Browser" events={activity.clientEvents} />
         </div>
       </details>

@@ -1,4 +1,4 @@
-//! Shared JSON request/response models for the server API.
+//! Shared JSON request/response models for the backend API.
 //!
 //! These types intentionally contain data only. Query execution belongs in the
 //! engine and HTTP concerns belong in `api.rs`. Keeping the wire contract here
@@ -69,7 +69,7 @@ pub struct GeoParquetInfo {
     pub warnings: Vec<String>,
 }
 
-/// Feature flags describing which operations this server version supports.
+/// Feature flags describing which operations this backend version supports.
 #[derive(Debug, Clone, Serialize)]
 pub struct Capabilities {
     pub arrow_ipc: bool,
@@ -143,8 +143,12 @@ pub struct SortClause {
     pub descending: bool,
 }
 
-fn default_page_limit() -> usize { 1000 }
-fn default_spatial_limit() -> usize { 20_000 }
+fn default_page_limit() -> usize {
+    1000
+}
+fn default_spatial_limit() -> usize {
+    20_000
+}
 
 /// Request for a row-window table page. Projection and filters are pushed into
 /// Parquet-RS before Arrow IPC is produced.
@@ -212,7 +216,9 @@ pub enum ExportFormat {
 }
 
 impl Default for ExportFormat {
-    fn default() -> Self { Self::Parquet }
+    fn default() -> Self {
+        Self::Parquet
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -279,7 +285,7 @@ pub struct HealthResponse {
 // These response types describe the *physical layout* of a Parquet file. They
 // intentionally do not contain rewrite/optimization commands: this application
 // is a portable viewer/explorer. A separate optimizer can consume the same
-// information later without coupling file-management behavior into this server.
+// information later without coupling file-management behavior into this backend.
 
 /// Cheap file-level physical-layout summary derived from Parquet metadata.
 #[derive(Debug, Clone, Serialize)]

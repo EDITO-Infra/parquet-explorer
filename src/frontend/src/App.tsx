@@ -116,7 +116,7 @@ export default function App() {
 
     try {
       if (dataset) {
-        // Dataset IDs are temporary server-side handles. Close the previous one
+        // Dataset IDs are temporary backend handles. Close the previous one
         // when changing URLs, but keep this best-effort: the backend idle TTL
         // also cleans it up if the browser disappears or this request fails.
         await closeDataset(dataset.dataset_id).catch(() => undefined)
@@ -417,6 +417,41 @@ export default function App() {
           </section>
         </main>
       )}
+
+      <footer className="project-footer">
+        {/*<div className="project-footer-copy">
+          <strong>Parquet Viewer</strong>
+          <span>
+            Developed at the Flanders Marine Institute (VLIZ) in the context of EDITO2,
+            the Horizon Europe project advancing the European Digital Twin Ocean.
+          </span>
+          <span className="project-footer-funding">
+            Funded by the European Union under grant agreement No. 101227771.
+          </span>
+        </div>*/}
+
+        <div className="project-footer-logos" aria-label="Project attribution">
+          <a href="https://www.edito.eu/" target="_blank" rel="noreferrer">
+            <img
+              className="edito-logo"
+              src="https://www.edito.eu/wp-content/uploads/2022/08/EDITO_Short_Logo_1.6.svg"
+              alt="Powered by EDITO"
+            />
+          </a>
+          <a
+            href="https://www.vliz.be/"
+            target="_blank"
+            rel="noreferrer"
+            aria-label="Flanders Marine Institute (VLIZ)"
+          >
+            <img
+              src="/vliz-logo.png"
+              className="footer-logo-vliz"
+              alt="VLIZ"
+            />
+          </a>
+        </div>
+      </footer>
     </div>
   )
 }
@@ -461,4 +496,3 @@ function makeTraceId(prefix: string) {
   const random = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
   return `${prefix}-${random}`
 }
-

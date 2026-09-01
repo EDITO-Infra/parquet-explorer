@@ -15,8 +15,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -101,7 +101,7 @@ impl ReadMetrics {
 ///
 /// Parquet-RS 59.2 deprecated its built-in `ParquetObjectReader` integration in
 /// favor of user-defined `AsyncFileReader` implementations. Keeping this
-/// adapter here lets the server use HTTP/S3/Azure/GCS/local range reads without
+/// adapter here lets the backend use HTTP/S3/Azure/GCS/local range reads without
 /// coupling the engine to Parquet's deprecated object_store feature.
 #[derive(Clone)]
 pub struct ObjectStoreReader {
@@ -130,7 +130,11 @@ impl AsyncFileReader for ObjectStoreReader {
         let metrics = self.metrics.clone();
         async move {
             let started = Instant::now();
-            let result = self.store.get_range(&self.path, range).await.map_err(to_parquet_err);
+            let result = self
+                .store
+                .get_range(&self.path, range)
+                .await
+                .map_err(to_parquet_err);
             let returned = result.as_ref().map_or(0, |bytes| bytes.len() as u64);
             metrics.record(1, 1, requested, returned, started.elapsed());
             result
@@ -155,9 +159,9 @@ impl AsyncFileReader for ObjectStoreReader {
                 .get_ranges(&self.path, &ranges)
                 .await
                 .map_err(to_parquet_err);
-            let returned = result
-                .as_ref()
-                .map_or(0, |chunks| chunks.iter().map(|bytes| bytes.len() as u64).sum());
+            let returned = result.as_ref().map_or(0, |chunks| {
+                chunks.iter().map(|bytes| bytes.len() as u64).sum()
+            });
             metrics.record(1, range_count, requested, returned, started.elapsed());
             result
         }
