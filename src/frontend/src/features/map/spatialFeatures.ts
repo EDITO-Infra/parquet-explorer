@@ -74,15 +74,15 @@ export function appendSpatialBatchFeatures(
         || !Number.isFinite(y)
       ) continue
 
-      const snapshotRow = rowOffset + row
+      const resultRow = rowOffset + row
       const properties = batchProperties(batch, propertyColumns, row)
       properties[source.longitude] = x
       properties[source.latitude] = y
-      properties.__pv_snapshot_row = snapshotRow + 1
+      properties.__pv_result_row = resultRow + 1
 
       features.push({
         type: 'Feature',
-        id: `${snapshotRow}:0`,
+        id: `${resultRow}:0`,
         geometry: { type: 'Point', coordinates: [x, y] },
         properties,
       })
@@ -100,14 +100,14 @@ export function appendSpatialBatchFeatures(
     const parsed = parseWkb(bytes)
     if (!parsed) continue
 
-    const snapshotRow = rowOffset + row
+    const resultRow = rowOffset + row
     const properties = batchProperties(batch, propertyColumns, row)
-    properties.__pv_snapshot_row = snapshotRow + 1
+    properties.__pv_result_row = resultRow + 1
 
     renderableGeometries(parsed).forEach((geometry, partIndex) => {
       features.push({
         type: 'Feature',
-        id: `${snapshotRow}:${partIndex}`,
+        id: `${resultRow}:${partIndex}`,
         geometry,
         properties: { ...properties },
       })

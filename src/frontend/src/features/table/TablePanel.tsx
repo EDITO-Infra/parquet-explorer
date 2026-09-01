@@ -1,15 +1,12 @@
 /**
- * Complete Table-tab presentation and interaction surface.
+ * Table-tab presentation and interaction surface.
  *
- * This component owns table-specific controls (filters, paging, projection and
- * rows-per-page selection). It does not fetch Parquet data itself: App owns the
- * shared query state and passes callbacks/state down. That keeps the table UI
- * reusable while preserving one clear coordinator for cross-feature effects
- * such as creating a map snapshot from the current filters.
+ * Page size is always a display limit (maximum 10,000 rows). Unfiltered data
+ * can stay backend-paged or explicitly switch to All. Filtered results are
+ * always streamed once and paged locally from the browser cache.
  */
 import type { PlainRow } from '../../lib/arrow'
-import type { DatasetInfo, FilterClause, MapSnapshotSpec } from '../../types'
-import type { SpatialSource } from '../map/spatial'
+import type { DatasetInfo, FilterClause } from '../../types'
 import { ColumnPicker } from './ColumnPicker'
 import { DataTable } from './DataTable'
 import { FilterBar } from './FilterBar'
@@ -22,15 +19,16 @@ interface TablePanelProps {
   offset: number
   limit: number
   totalRows: number | null
+  loadedRows: number
   loading: boolean
-  countLoading: boolean
-  spatialSource?: SpatialSource
-  mapSnapshot: MapSnapshotSpec | null
+  fullResult: boolean
+  fullResultComplete: boolean
+  loadAll: boolean
   onApplyFilters: (filters: FilterClause[]) => void
   onOffsetChange: (offset: number) => void
   onVisibleColumnsChange: (columns: string[]) => void
   onLimitChange: (limit: number) => void
-  onViewMap: () => void
+  onLoadAllChange: (loadAll: boolean) => void
 }
 
 export function TablePanel({
@@ -41,22 +39,28 @@ export function TablePanel({
   offset,
   limit,
   totalRows,
+  loadedRows,
   loading,
-  countLoading,
-  spatialSource,
-  mapSnapshot,
+  fullResult,
+  fullResultComplete,
+  loadAll,
   onApplyFilters,
   onOffsetChange,
   onVisibleColumnsChange,
   onLimitChange,
-  onViewMap,
+  onLoadAllChange,
 }: TablePanelProps) {
+  const localAvailableRows = fullResult ? loadedRows : totalRows ?? 0
+  const canGoNext = fullResult
+    ? offset + limit < localAvailableRows
+    : totalRows != null && offset + rows.length < totalRows
+
   return (
     <section className="pane">
       <FilterBar
         columns={dataset.columns}
         filters={filters}
-        disabled={loading}
+        disabled={false}
         onApply={onApplyFilters}
       />
 
@@ -64,25 +68,25 @@ export function TablePanel({
         <div className="pager">
           <button
             className="secondary"
-            disabled={offset === 0 || loading || visibleColumns.length === 0}
+            disabled={offset === 0 || visibleColumns.length === 0}
             onClick={() => onOffsetChange(Math.max(0, offset - limit))}
           >
             Previous
           </button>
-          <span>
-            {visibleColumns.length === 0
-              ? `No columns selected · ${countLoading || totalRows == null ? 'counting…' : totalRows.toLocaleString()}${filters.length ? ' matching' : ' rows'}`
-              : `${rows.length ? `${(offset + 1).toLocaleString()}–${(offset + rows.length).toLocaleString()}` : '0 rows'} of ${countLoading || totalRows == null ? 'counting…' : totalRows.toLocaleString()}${filters.length ? ' matching' : ''}`}
-          </span>
+          <span>{pagerLabel({
+            rows,
+            filters,
+            visibleColumns,
+            offset,
+            totalRows,
+            loadedRows,
+            loading,
+            fullResult,
+            fullResultComplete,
+          })}</span>
           <button
             className="secondary"
-            disabled={
-              loading
-              || countLoading
-              || visibleColumns.length === 0
-              || totalRows == null
-              || offset + rows.length >= totalRows
-            }
+            disabled={visibleColumns.length === 0 || !canGoNext}
             onClick={() => onOffsetChange(offset + limit)}
           >
             Next
@@ -90,32 +94,34 @@ export function TablePanel({
         </div>
 
         <div className="table-controls">
-          {spatialSource && (
-            <button
-              type="button"
-              className="map-switch-button"
-              disabled={loading || countLoading || totalRows == null}
-              onClick={onViewMap}
-              title="Create a map from the current filtered result"
-            >
-              {countLoading
-                ? 'Counting…'
-                : mapSnapshot && sameFilters(mapSnapshot.filters, filters)
-                  ? 'Refresh map'
-                  : 'View on map'}
-            </button>
+          {filters.length > 0 ? (
+            <span className="result-scope-note" title="The matching result is streamed once; table pages are local.">
+              All matching rows
+            </span>
+          ) : (
+            <label title="Paged reads only the current table page. All deliberately streams the complete dataset into the browser.">
+              Result{' '}
+              <select
+                value={loadAll ? 'all' : 'paged'}
+                onChange={event => onLoadAllChange(event.target.value === 'all')}
+              >
+                <option value="paged">Paged</option>
+                <option value="all">All</option>
+              </select>
+            </label>
           )}
+
           <ColumnPicker
             columns={dataset.columns}
             visibleColumns={visibleColumns}
-            disabled={loading}
+            disabled={false}
             onChange={onVisibleColumnsChange}
           />
+
           <label>
             Rows per page{' '}
             <select
               value={limit}
-              disabled={loading}
               onChange={event => onLimitChange(Number(event.target.value))}
             >
               <option>250</option>
@@ -132,6 +138,43 @@ export function TablePanel({
   )
 }
 
-function sameFilters(left: FilterClause[], right: FilterClause[]): boolean {
-  return JSON.stringify(left) === JSON.stringify(right)
+function pagerLabel({
+  rows,
+  filters,
+  visibleColumns,
+  offset,
+  totalRows,
+  loadedRows,
+  loading,
+  fullResult,
+  fullResultComplete,
+}: {
+  rows: PlainRow[]
+  filters: FilterClause[]
+  visibleColumns: string[]
+  offset: number
+  totalRows: number | null
+  loadedRows: number
+  loading: boolean
+  fullResult: boolean
+  fullResultComplete: boolean
+}): string {
+  const qualifier = filters.length > 0 ? ' matching' : ''
+
+  if (visibleColumns.length === 0) {
+    if (fullResult && !fullResultComplete) {
+      return `${loadedRows.toLocaleString()}${qualifier} rows loaded${loading ? '…' : ''}`
+    }
+    return `${(totalRows ?? loadedRows).toLocaleString()}${qualifier} rows`
+  }
+
+  const range = rows.length
+    ? `${(offset + 1).toLocaleString()}–${(offset + rows.length).toLocaleString()}`
+    : '0 rows'
+
+  if (fullResult && !fullResultComplete) {
+    return `${range} · ${loadedRows.toLocaleString()}${qualifier} rows loaded${loading ? '…' : ''}`
+  }
+
+  return `${range} of ${(totalRows ?? loadedRows).toLocaleString()}${qualifier}`
 }

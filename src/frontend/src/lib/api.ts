@@ -10,7 +10,7 @@
  * endpoint and must not be inferred from these timestamps.
  */
 import { RecordBatch, RecordBatchReader } from 'apache-arrow'
-import type { AnalysisRecommendationsResponse, AnalysisSummaryResponse, ColumnsAnalysisResponse, CountResponse, DatasetInfo, FilterClause, PageRequest, PagesAnalysisResponse, QueryCostRequest, QueryCostResponse, RowGroupsAnalysisResponse, SnapshotRequest, SpatialRequest, TraceSnapshot } from '../types'
+import type { AnalysisRecommendationsResponse, AnalysisSummaryResponse, ColumnsAnalysisResponse, CountResponse, DatasetInfo, FilterClause, PageRequest, PagesAnalysisResponse, QueryCostRequest, QueryCostResponse, ResultRequest, RowGroupsAnalysisResponse, SpatialRequest, TraceSnapshot } from '../types'
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')
 const V1 = `${API_BASE}/api/v1`
@@ -113,16 +113,19 @@ export async function* pageBatches(
   datasetId: string,
   request: PageRequest,
   onDiagnostic?: ArrowDiagnosticHandler,
+  signal?: AbortSignal,
 ): AsyncGenerator<RecordBatch> {
-  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/page`, request, onDiagnostic)
+  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/page`, request, onDiagnostic, signal)
 }
 
-export async function* snapshotBatches(
+/** Stream the complete current result without a row-window limit. */
+export async function* resultBatches(
   datasetId: string,
-  request: SnapshotRequest,
+  request: ResultRequest,
   onDiagnostic?: ArrowDiagnosticHandler,
+  signal?: AbortSignal,
 ): AsyncGenerator<RecordBatch> {
-  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/snapshot`, request, onDiagnostic)
+  yield* arrowRequest(`${V1}/datasets/${encodeURIComponent(datasetId)}/result`, request, onDiagnostic, signal)
 }
 
 export async function countRows(datasetId: string, filters: FilterClause[] = [], traceId?: string): Promise<number> {
@@ -154,12 +157,14 @@ async function* arrowRequest(
   url: string,
   payload: unknown,
   onDiagnostic?: ArrowDiagnosticHandler,
+  signal?: AbortSignal,
 ): AsyncGenerator<RecordBatch> {
   const requestStarted = performance.now()
   const response = await expectOk(await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
+    signal,
   }))
   const headersAt = performance.now()
   onDiagnostic?.({

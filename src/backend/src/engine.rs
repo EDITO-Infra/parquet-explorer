@@ -34,7 +34,7 @@ use crate::model::{
     AnalysisRecommendationsResponse, AnalysisSummaryResponse, Capabilities, ColumnInfo,
     ColumnsAnalysisResponse, CountRequest, DatasetEntry, DatasetInfo, ExportFormat, ExportRequest,
     GeoColumnInfo, GeoParquetInfo, PageRequest, PagesAnalysisQuery, PagesAnalysisResponse,
-    QueryCostRequest, QueryCostResponse, RowGroupsAnalysisResponse, SnapshotRequest, SpatialRequest,
+    QueryCostRequest, QueryCostResponse, RowGroupsAnalysisResponse, ResultRequest, SpatialRequest,
     TraceSnapshot,
 };
 use filter::apply_filters;
@@ -271,16 +271,19 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Stream the complete filtered snapshot requested by the map view.
-    pub async fn snapshot_stream(
+    /// Stream the complete projected result, optionally filtered, without paging.
+    ///
+    /// This is intentionally separate from `page_stream`: filtered browser
+    /// results and explicit All loads use one stream and paginate locally.
+    pub async fn result_stream(
         &self,
         dataset_id: &str,
-        req: SnapshotRequest,
+        req: ResultRequest,
     ) -> Result<IpcByteStream> {
         let trace = self.traces.start(
             req.trace_id.as_deref(),
-            "snapshot",
-            "Preparing map data",
+            "result",
+            "Preparing complete result",
         );
         let entry = self.entry(dataset_id)?;
         if let Some(trace) = &trace { trace.event("dataset_found", "Dataset handle found"); }
@@ -298,7 +301,7 @@ impl CoreEngine {
         if let Some(trace) = &trace { trace.event("reader_ready", "Reader plan ready"); }
         let stream = builder
             .build()
-            .context("could not build filtered snapshot reader")?;
+            .context("could not build complete result reader")?;
         let schema = Arc::clone(stream.schema());
         Ok(spawn_ipc_stream(
             stream,

@@ -1,16 +1,16 @@
 .PHONY: check test dev-backend dev-frontend build-backend build-frontend docker docs docs-build docs-preview
 
 check:
-	cargo check --manifest-path src/server/Cargo.toml
+	cargo check --manifest-path src/backend/Cargo.toml
 
 test:
-	cargo test --manifest-path src/server/Cargo.toml
+	cargo test --manifest-path src/backend/Cargo.toml
 
 build-backend:
-	cargo build --release --manifest-path src/server/Cargo.toml
+	cargo build --release --manifest-path src/backend/Cargo.toml
 
 dev-backend:
-	RUST_LOG=info cargo run --manifest-path src/server/Cargo.toml
+	RUST_LOG=info cargo run --manifest-path src/backend/Cargo.toml
 
 dev-frontend:
 	cd src/frontend && npm run dev

@@ -2,7 +2,7 @@
 
 ## Role
 
-The frontend is the browser workspace for opening a dataset, exploring rows, inspecting schema/statistics, viewing a map snapshot, and seeing request progress/diagnostics.
+The frontend is the browser workspace for opening a dataset, exploring rows, inspecting schema/statistics, viewing the current result on a map, and seeing request progress/diagnostics.
 
 Parquet reading and physical-layout interpretation remain backend responsibilities.
 
@@ -52,7 +52,7 @@ The ID is temporary and process-local. Opening another URL best-effort closes th
 
 Keep state at the lowest level that needs to share it:
 
-- active dataset, filters, projection, paging, and map snapshot coordination belong at the workspace level when multiple features need them;
+- active dataset, filters, paging, complete-result cache, and map coordination belong at the workspace level when multiple features need them;
 - local interaction state stays inside the relevant feature;
 - transport and Arrow conversion stay outside React components.
 
@@ -60,11 +60,11 @@ The aim is to avoid both a giant `App.tsx` and a large number of tiny components
 
 ## Table
 
-The table feature owns filter/projection controls, paging, and row rendering. Column selection affects the backend projection, so it can change physical read cost rather than merely hide columns visually.
+The table feature owns filter/projection controls, paging, and row rendering. Unfiltered browsing uses backend pages. Filtered results (and explicit **All**) are streamed once into a browser cache and table paging is then local, with a maximum visible page size of 10,000 rows. Column selection still controls the backend projection.
 
 ## Map
 
-The map feature owns spatial-source selection, WKB/coordinate conversion, and MapLibre interaction. The current map is based on a frozen filtered snapshot; ordinary map interaction does not re-query Parquet.
+The map feature owns spatial-source selection, WKB/coordinate conversion, and MapLibre interaction. Unfiltered Map uses the current table page; filtered or explicit All modes use the shared complete-result cache. Ordinary map interaction does not re-query Parquet.
 
 ## Diagnostics
 
@@ -88,6 +88,6 @@ Avoid documenting the planned layout/components in more detail until that UI exi
 - Keep Parquet analysis logic out of React.
 - Keep shared HTTP/Arrow transport behind `lib/api.ts`.
 - Stream row results where practical.
-- Avoid reading/decoding geometry unless it is needed.
+- Avoid forcing geometry into ordinary unfiltered table-page reads unless it is visible or Map needs that page.
 - Ignore stale asynchronous results when newer requests supersede them.
 - Split code around coherent responsibilities, not arbitrary line counts.

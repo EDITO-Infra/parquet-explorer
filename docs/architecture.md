@@ -70,11 +70,11 @@ The frontend sends a URL to `/datasets/open`. The backend validates the source a
 
 ### Table
 
-The frontend sends the current projection, filters, offset, and limit. The engine reads the relevant Parquet data and streams Arrow IPC batches to the browser.
+Unfiltered exploration uses bounded `/page` requests. Once filters are active, the backend streams the complete projected matching result through `/result` once and the browser pages that cache locally. Choosing **All** explicitly uses the same complete-result path without filters. Table page size remains capped at 10,000 rows.
 
 ### Map
 
-The map uses a frozen snapshot of the selected filter state. Pan/zoom and basemap changes operate on the browser-side snapshot rather than silently issuing new Parquet scans.
+Table and Map share the current browser result. Unfiltered exploration is backend-paged and Map shows the current page; filtered or explicit All results are streamed once and paged locally. Pan/zoom and basemap changes do not issue Parquet scans.
 
 ### Diagnostics
 

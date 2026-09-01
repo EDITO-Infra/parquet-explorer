@@ -2,7 +2,7 @@ services:
   backend:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: deploy/Dockerfile.backend
     environment:
       PV_CORS_ORIGINS: http://localhost:3000
       PV_ALLOWED_SOURCE_SCHEMES: https,http
@@ -13,7 +13,7 @@ services:
   frontend:
     build:
       context: .
-      dockerfile: Dockerfile.frontend
+      dockerfile: deploy/Dockerfile.frontend
     depends_on:
       - backend
     ports:

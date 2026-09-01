@@ -25,7 +25,7 @@ use crate::{
         AnalysisRecommendationsResponse, AnalysisSummaryResponse, ColumnsAnalysisResponse,
         CountRequest, CountResponse, DatasetInfo, DatasetOpenRequest, ExportRequest,
         HealthResponse, PageRequest, PagesAnalysisQuery, PagesAnalysisResponse, QueryCostRequest,
-        QueryCostResponse, RowGroupsAnalysisResponse, SchemaResponse, SnapshotRequest,
+        QueryCostResponse, RowGroupsAnalysisResponse, SchemaResponse, ResultRequest,
         SpatialRequest,
     },
     security::validate_source_uri,
@@ -64,7 +64,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/datasets/{dataset_id}/page", post(page))
         .route("/datasets/{dataset_id}/count", post(count))
-        .route("/datasets/{dataset_id}/snapshot", post(snapshot))
+        .route("/datasets/{dataset_id}/result", post(result))
         .route("/datasets/{dataset_id}/spatial", post(spatial))
         .route("/datasets/{dataset_id}/export", post(export))
         .route("/diagnostics/{trace_id}", get(diagnostics))
@@ -262,18 +262,18 @@ async fn page(
     Ok(streaming_arrow_response(stream, None))
 }
 
-async fn snapshot(
+async fn result(
     State(state): State<Arc<AppState>>,
     Path(dataset_id): Path<String>,
-    Json(payload): Json<SnapshotRequest>,
+    Json(payload): Json<ResultRequest>,
 ) -> Result<Response, ApiError> {
     let trace_id = payload.trace_id.clone();
-    let stream = match state.engine.snapshot_stream(&dataset_id, payload).await {
+    let stream = match state.engine.result_stream(&dataset_id, payload).await {
         Ok(stream) => stream,
         Err(error) => {
             state
                 .engine
-                .trace_fail(trace_id.as_deref(), "Map data query failed");
+                .trace_fail(trace_id.as_deref(), "Complete result query failed");
             return Err(ApiError::from_engine(error));
         }
     };

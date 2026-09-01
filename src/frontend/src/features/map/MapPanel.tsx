@@ -1,13 +1,10 @@
 /**
- * MapLibre owner for the frozen map snapshot.
+ * MapLibre owner for the current browser-side result.
  *
- * MapLibre is imperative rather than React-native: we explicitly create/destroy
- * a Map instance, attach event handlers, maintain GeoJSON sources/layers and
- * update them as Arrow snapshot batches arrive.
- *
- * The map is intentionally NOT a live viewport-query system. A snapshot is read
- * from the current table filters, then pan/zoom/projection/basemap interactions
- * happen locally without issuing additional Parquet reads.
+ * Data loading belongs to App: an unfiltered map receives the current table
+ * page, while filtered/All modes receive the shared complete-result cache.
+ * MapPanel only renders and interacts with those features; pan/zoom never issue
+ * Parquet queries.
  */
 import { useEffect, useRef, useState } from 'react'
 import {
@@ -22,10 +19,8 @@ import type {
 } from 'maplibre-gl'
 import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
 import type { Feature, FeatureCollection, Geometry, Position } from 'geojson'
-import { snapshotBatches } from '../../lib/api'
-import type { DatasetInfo, MapSnapshotSpec } from '../../types'
+import type { DatasetInfo } from '../../types'
 import type { SpatialSource } from './spatial'
-import { appendSpatialBatchFeatures, selectMapPropertyColumns, spatialColumnNames } from './spatialFeatures'
 
 setWorkerUrl(workerUrl)
 
@@ -54,12 +49,6 @@ type ProjectionMode = 'mercator' | 'globe'
 type Theme = 'light' | 'dark'
 type FeatureId = string | number
 
-export type MapActivityUpdate =
-  | { type: 'start'; traceId: string; message: string }
-  | { type: 'progress'; traceId: string; message: string; detail?: string; progress?: number; durationMs?: number }
-  | { type: 'complete'; traceId: string; message: string; detail?: string }
-  | { type: 'error'; traceId: string; message: string }
-
 type SelectionBox = {
   left: number
   top: number
@@ -78,24 +67,33 @@ type BoundsAccumulator = {
 export function MapPanel({
   dataset,
   source,
-  snapshot,
-  seedFeatures,
+  features,
+  rowsLoaded,
+  scopeLabel,
+  dataKey,
+  dataRevision,
+  loading,
+  complete,
   theme,
   active,
-  onActivity,
 }: {
   dataset: DatasetInfo
   source: SpatialSource
-  snapshot: MapSnapshotSpec
-  seedFeatures: Feature[]
+  features: Feature[]
+  rowsLoaded: number
+  scopeLabel: string
+  dataKey: string
+  dataRevision: number
+  loading: boolean
+  complete: boolean
   theme: Theme
   active: boolean
-  onActivity?: (update: MapActivityUpdate) => void
 }) {
   const initialBasemap: BasemapId = theme === 'dark' ? 'dark' : 'positron'
   const container = useRef<HTMLDivElement | null>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
-  const requestId = useRef(0)
+  const fittedDataKeyRef = useRef<string | null>(null)
+  const finalFittedDataKeyRef = useRef<string | null>(null)
   const featuresRef = useRef<Feature[]>([])
   const selectedIdsRef = useRef<FeatureId[]>([])
   const projectionRef = useRef<ProjectionMode>('mercator')
@@ -239,108 +237,46 @@ export function MapPanel({
     })
 
     return () => {
-      requestId.current += 1
       map.remove()
       mapRef.current = null
     }
   }, [dataset.dataset_id, source])
 
-  // Snapshot lifecycle. A new snapshot triggers one Arrow stream; subsequent pan,
-  // zoom, style and projection changes operate on the locally cached features.
+  // Render data supplied by App. `dataRevision` is deliberately separate from
+  // row-count progress so a large growing GeoJSON source is not rebuilt for
+  // every Arrow batch.
   useEffect(() => {
     const map = mapRef.current
-    if (!map) return
+    if (!map || !active) return
 
-    const thisRequest = ++requestId.current
-    const traceId = makeTraceId('map')
-    onActivity?.({ type: 'start', traceId, message: 'Preparing map query' })
-    const seed = seedFeatures.slice()
-    featuresRef.current = seed
-    selectedIdsRef.current = []
-    setFeatureCount(seed.length)
-    setProcessedRows(0)
+    const next = features.slice()
+    featuresRef.current = next
+    setFeatureCount(next.length)
     setSelectedIds([])
     setSelectedProperties(null)
-    setStatus(seed.length
-      ? `Showing ${seed.length.toLocaleString()} preview features while loading the full map…`
-      : 'Loading map data…')
-    setMapFeatures(map, seed)
+    setMapFeatures(map, next)
 
-    const bounds = emptyBounds()
-    for (const feature of seed) extendBoundsWithGeometry(bounds, feature.geometry)
-    if (seed.length > 0) fitSnapshotBounds(map, bounds)
-    // Recompute the final bounds from the authoritative full snapshot stream.
-    const fullBounds = emptyBounds()
+    const needsInitialFit = next.length > 0 && fittedDataKeyRef.current !== dataKey
+    const needsFinalFit = next.length > 0 && complete && finalFittedDataKeyRef.current !== dataKey
+    if (needsInitialFit || needsFinalFit) {
+      const bounds = emptyBounds()
+      for (const feature of next) extendBoundsWithGeometry(bounds, feature.geometry)
+      fitSnapshotBounds(map, bounds)
+      fittedDataKeyRef.current = dataKey
+      if (complete) finalFittedDataKeyRef.current = dataKey
+    }
+  }, [active, dataKey, dataRevision, features, complete])
 
-    let lastPaintedRows = 0
-    void loadSnapshotFeatures(
-      dataset,
-      source,
-      snapshot,
-      traceId,
-      thisRequest,
-      requestId,
-      fullBounds,
-      (features, rowsRead) => {
-        if (thisRequest !== requestId.current) return
-        setFeatureCount(features.length)
-        setProcessedRows(rowsRead)
-        setStatus(
-          `Loading geometries… ${rowsRead.toLocaleString()} / ${snapshot.expectedRows.toLocaleString()} rows`,
-        )
-        onActivity?.({
-          type: 'progress',
-          traceId,
-          message: 'Loading geometries',
-          detail: `${features.length.toLocaleString()} features from ${rowsRead.toLocaleString()} rows`,
-          progress: Math.min(0.98, rowsRead / Math.max(1, snapshot.expectedRows)),
-        })
-
-        // Painting the complete, ever-growing GeoJSON source after every small
-        // Arrow batch becomes quadratic on very large snapshots. Paint the first
-        // batch immediately, then in larger increments; the final snapshot is
-        // always painted once in full below.
-        if (lastPaintedRows === 0 || rowsRead - lastPaintedRows >= 50_000) {
-          featuresRef.current = features.slice()
-          setMapFeatures(map, features)
-          lastPaintedRows = rowsRead
-        }
-      },
-      diagnostic => onActivity?.({
-        type: 'progress',
-        traceId,
-        message: diagnostic.message,
-        detail: diagnostic.detail,
-        durationMs: diagnostic.durationMs,
-      }),
-    ).then(({ features, rowsRead, geometryDecodeMs }) => {
-      if (thisRequest !== requestId.current) return
-      featuresRef.current = features
-      setMapFeatures(map, features)
-      setFeatureCount(features.length)
-      setProcessedRows(rowsRead)
-      setStatus('Map ready · pan and zoom do not re-query the file')
-      onActivity?.({
-        type: 'progress',
-        traceId,
-        message: source.kind === 'geometry' ? 'Decoding WKB geometries total' : 'Building coordinate geometries total',
-        detail: `${features.length.toLocaleString()} geometries from ${rowsRead.toLocaleString()} rows`,
-        durationMs: geometryDecodeMs,
-      })
-      onActivity?.({
-        type: 'complete',
-        traceId,
-        message: 'Map ready',
-        detail: `${features.length.toLocaleString()} geometries loaded`,
-      })
-      fitSnapshotBounds(map, fullBounds)
-    }).catch(error => {
-      if (thisRequest === requestId.current) {
-        setStatus(String(error))
-        onActivity?.({ type: 'error', traceId, message: 'Map loading failed' })
-      }
-    })
-  }, [dataset.dataset_id, source, snapshot.id])
+  // Status text can update for every streamed batch without touching MapLibre's
+  // GeoJSON source.
+  useEffect(() => {
+    setProcessedRows(rowsLoaded)
+    setStatus(loading
+      ? `Loading ${scopeLabel.toLowerCase()}… ${rowsLoaded.toLocaleString()} rows`
+      : complete
+        ? 'Map ready · pan and zoom do not re-query the file'
+        : 'Preparing map data…')
+  }, [rowsLoaded, scopeLabel, loading, complete])
 
   function changeProjection(next: ProjectionMode) {
     if (next === projectionRef.current) return
@@ -381,7 +317,7 @@ export function MapPanel({
             </>
           )}
           {' · '}
-          <strong>{snapshot.expectedRows.toLocaleString()}</strong> frozen rows
+          <strong>{scopeLabel}</strong> · {rowsLoaded.toLocaleString()} rows loaded
         </span>
 
         <div className="map-toolbar-controls">
@@ -467,7 +403,7 @@ export function MapPanel({
       </div>
 
       <div className="map-note">
-        This map uses the filters from the Table tab. Pan and zoom are instant because the file is not queried again. Click a feature to inspect it, or use Box select to select an area.
+        Map reflects the current table state. Unfiltered data uses the current page; filtered or All results use the shared browser cache. Pan and zoom do not query the file.
       </div>
     </div>
   )
@@ -567,57 +503,6 @@ function ensureParquetLayers(map: MapLibreMap) {
       },
     })
   }
-}
-
-async function loadSnapshotFeatures(
-  dataset: DatasetInfo,
-  source: SpatialSource,
-  snapshot: MapSnapshotSpec,
-  traceId: string,
-  thisRequest: number,
-  requestId: { current: number },
-  bounds: BoundsAccumulator,
-  onProgress: (features: Feature[], processedRows: number) => void,
-  onDiagnostic: (event: { message: string; detail?: string; durationMs?: number }) => void,
-): Promise<{ features: Feature[]; rowsRead: number; geometryDecodeMs: number }> {
-  const propertyColumns = selectMapPropertyColumns(dataset, source)
-  const columns = [...spatialColumnNames(source), ...propertyColumns]
-
-  const features: Feature[] = []
-  let rowsRead = 0
-  let geometryDecodeMs = 0
-
-  for await (
-    const batch of snapshotBatches(
-      dataset.dataset_id,
-      {
-        trace_id: traceId,
-        columns,
-        filters: snapshot.filters,
-      },
-      onDiagnostic,
-    )
-  ) {
-    if (thisRequest !== requestId.current) break
-
-    const before = features.length
-    const geometryStarted = performance.now()
-    appendSpatialBatchFeatures(batch, source, propertyColumns, features, rowsRead)
-    geometryDecodeMs += performance.now() - geometryStarted
-    for (let index = before; index < features.length; index += 1) {
-      extendBoundsWithGeometry(bounds, features[index].geometry)
-    }
-
-    rowsRead += batch.numRows
-    onProgress(features, rowsRead)
-  }
-
-  return { features, rowsRead, geometryDecodeMs }
-}
-
-function makeTraceId(prefix: string) {
-  const random = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
-  return `${prefix}-${random}`
 }
 
 function availableFeatureLayers(map: MapLibreMap): string[] {

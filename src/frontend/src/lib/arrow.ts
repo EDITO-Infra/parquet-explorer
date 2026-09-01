@@ -1,21 +1,38 @@
 /**
  * Apache Arrow -> table-friendly JavaScript conversion helpers.
  *
- * The API layer yields Arrow RecordBatch objects. The table does not need to
- * understand Arrow vectors, so this module converts batch values to plain JS
- * objects and normalizes values that are awkward to render directly.
+ * Complete filtered results are kept as Arrow RecordBatches in the browser.
+ * Only the currently visible table page is materialized into plain JS rows.
  */
 import type { RecordBatch } from 'apache-arrow'
 
 export type PlainRow = Record<string, unknown>
 
-export function batchRows(batch: RecordBatch, maxRows = Number.POSITIVE_INFINITY): PlainRow[] {
+export function batchRows(
+  batch: RecordBatch,
+  maxRows = Number.POSITIVE_INFINITY,
+  columns?: string[],
+): PlainRow[] {
+  return batchRowsRange(batch, 0, maxRows, columns)
+}
+
+/** Convert a row window from one RecordBatch into display-friendly objects. */
+export function batchRowsRange(
+  batch: RecordBatch,
+  startRow: number,
+  maxRows: number,
+  columns?: string[],
+): PlainRow[] {
   const rows: PlainRow[] = []
-  const count = Math.min(batch.numRows, maxRows)
-  for (let rowIndex = 0; rowIndex < count; rowIndex += 1) {
+  const first = Math.max(0, Math.min(batch.numRows, startRow))
+  const count = Math.max(0, Math.min(batch.numRows - first, maxRows))
+  const selected = columns ? new Set(columns) : undefined
+
+  for (let rowIndex = first; rowIndex < first + count; rowIndex += 1) {
     const row: PlainRow = {}
     for (let columnIndex = 0; columnIndex < batch.numCols; columnIndex += 1) {
       const field = batch.schema.fields[columnIndex]
+      if (selected && !selected.has(field.name)) continue
       const vector = batch.getChildAt(columnIndex)
       row[field.name] = plainValue(vector?.get(rowIndex))
     }

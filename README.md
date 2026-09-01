@@ -42,7 +42,7 @@ The browser currently provides:
 - paged/filtered table exploration with column projection;
 - schema and file statistics;
 - live request progress/diagnostics;
-- frozen filtered map snapshots for detected spatial data;
+- map views that follow the current table/query state;
 - Arrow/Parquet subset export.
 
 The read-only Analysis API is implemented, but a dedicated Analysis UI is not yet present. See [`docs/analysis.md`](docs/analysis.md).
@@ -59,7 +59,7 @@ Base path: `/api/v1`.
 | `GET /datasets/{id}/schema` | schema |
 | `POST /datasets/{id}/page` | streamed Arrow IPC table page |
 | `POST /datasets/{id}/count` | exact filtered row count |
-| `POST /datasets/{id}/snapshot` | streamed frozen filtered snapshot |
+| `POST /datasets/{id}/result` | complete projected result stream, optionally filtered |
 | `POST /datasets/{id}/spatial` | streamed spatial query |
 | `POST /datasets/{id}/export` | Arrow or Parquet subset export |
 | `GET /datasets/{id}/analysis/summary` | physical-layout summary |
@@ -72,6 +72,10 @@ Base path: `/api/v1`.
 | `DELETE /datasets/{id}` | close temporary dataset handle |
 
 See [`docs/ANALYSIS_API.md`](docs/ANALYSIS_API.md) for the analysis routes.
+
+## Result loading
+
+Unfiltered table exploration uses bounded `/page` reads. Applying filters streams the complete matching projected result once through `/result`; the browser then pages that cached result locally with a maximum table page size of 10,000 rows. Selecting **All** explicitly uses the same complete-result stream without filters. Map shows the current unfiltered page or reuses the filtered/All cache.
 
 ## Dataset IDs
 

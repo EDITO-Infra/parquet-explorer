@@ -168,9 +168,12 @@ pub struct PageRequest {
     pub sort: Vec<SortClause>,
 }
 
-/// Request for a complete filtered snapshot used by the map.
+/// Request for a complete result stream with projection and optional filters.
+///
+/// Unlike `PageRequest`, this request has no row window. The browser uses it
+/// for filtered-result caching and for an explicit user-requested All load.
 #[derive(Debug, Clone, Deserialize)]
-pub struct SnapshotRequest {
+pub struct ResultRequest {
     #[serde(default)]
     pub trace_id: Option<String>,
     #[serde(default)]

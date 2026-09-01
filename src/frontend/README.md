@@ -25,6 +25,10 @@ The backend analysis API is already available, but the interactive Analysis feat
 
 **TODO:** add it under `features/analysis/` and consume the existing typed API helpers rather than duplicating Parquet analysis logic in the browser.
 
+## Result loading
+
+Unfiltered table browsing uses bounded backend pages. Applying filters switches to one complete filtered Arrow stream, cached in the browser and paged locally. **All** deliberately does the same without filters. The table page size remains capped at 10,000 rows. Map consumes the current page or the same complete-result cache rather than issuing its own filtered scan.
+
 ## Ownership rule
 
 Keep cross-feature state in `App.tsx`, feature-local behavior in its feature folder, and shared transport/Arrow conversion in `lib/`. Avoid adding large feature-specific blocks back into `App.tsx`.

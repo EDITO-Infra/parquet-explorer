@@ -4,7 +4,7 @@ export function LandingPanel() {
     <main className="landing">
       <div className="landing-card">
         <span className="eyebrow">Parquet + GeoParquet</span>
-        <h2>Explore a Parquet file without downloading it first.</h2>
+        <h2>Explore and view data in a Parquet file</h2>
         <p>
           Paste a file URL to preview rows, filter values, inspect the schema,
           and map spatial data when it is available.

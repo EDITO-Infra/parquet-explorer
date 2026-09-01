@@ -2,7 +2,7 @@
  * Shared frontend data contracts.
  *
  * Most interfaces in this file mirror Rust API request/response models. A small
- * number describe browser-only state such as a frozen map snapshot. These are
+ * number describe browser-only viewer state. These are
  * TypeScript types only: they are erased when the browser bundle is built and do
  * not execute at runtime.
  */
@@ -83,16 +83,10 @@ export interface TraceSnapshot {
   events: TraceEvent[]
 }
 
-export interface SnapshotRequest {
+export interface ResultRequest {
   trace_id?: string
   columns?: string[]
   filters?: FilterClause[]
-}
-
-export interface MapSnapshotSpec {
-  id: number
-  filters: FilterClause[]
-  expectedRows: number
 }
 
 export interface CountRequest {

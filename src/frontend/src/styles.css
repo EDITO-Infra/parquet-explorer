@@ -363,9 +363,8 @@ button.compact { padding: 6px 9px; border-radius: 6px; font-size: 11px; }
   .map-basemap-select span { display: none; }
 }
 
-/* Frozen map snapshot + interactive geometry selection */
+/* Map result + interactive geometry selection */
 .pane-hidden { display: none !important; }
-.map-switch-button { white-space: nowrap; }
 .map-toolbar .active-tool {
   background: var(--accent-2);
   border-color: var(--accent-2);
@@ -438,7 +437,6 @@ button.compact { padding: 6px 9px; border-radius: 6px; font-size: 11px; }
 }
 @media (max-width: 900px) {
   .map-toolbar-controls { flex-wrap: wrap; }
-  .map-switch-button { order: -1; }
 }
 
 /* Friendly shell + query diagnostics */
@@ -791,4 +789,17 @@ body {
 @media (max-width: 700px) {
   .project-footer { align-items: flex-start; flex-direction: column; }
   .project-footer-logos { justify-content: flex-start; }
+}
+
+/* Indicates when table pagination is operating on a complete browser-side result. */
+.result-scope-note {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
 }

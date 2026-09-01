@@ -1,61 +1,77 @@
 /**
  * Top-level viewer coordinator.
  *
- * App owns state that must be shared across the main viewer areas (dataset,
- * filters, paging, selected columns, map snapshot and diagnostics) and
- * coordinates the major workflows that connect UI actions to the API.
- *
- * It deliberately does NOT implement Parquet parsing, Arrow IPC decoding, trace
- * polling, or large feature-specific view trees. Those concerns live under
- * `lib/` and `features/`. App remains the one place where state shared by Table,
- * Map, Schema and future Analysis views is coordinated.
+ * App owns state shared across Table, Map, Schema and diagnostics. Unfiltered
+ * browsing remains backend-paged. Once filters are active (or the user
+ * explicitly chooses All), one complete Arrow result is streamed into the
+ * browser and both Table and Map read from that same cached result.
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import type { Feature } from 'geojson'
-import { batchRows, type PlainRow } from './lib/arrow'
-import { closeDataset, countRows, openDataset, pageBatches } from './lib/api'
+import type { RecordBatch } from 'apache-arrow'
+import { batchRows, batchRowsRange, type PlainRow } from './lib/arrow'
+import { closeDataset, openDataset, pageBatches, resultBatches } from './lib/api'
 import { DatasetSidebar } from './features/dataset/DatasetSidebar'
 import { LandingPanel } from './features/dataset/LandingPanel'
 import { OpenFileBar } from './features/dataset/OpenFileBar'
 import { ProgressPanel } from './features/diagnostics/ProgressPanel'
 import { useActivityTrace } from './features/diagnostics/useActivityTrace'
-import { MapPanel, type MapActivityUpdate } from './features/map/MapPanel'
+import { MapPanel } from './features/map/MapPanel'
 import { detectSpatialSource } from './features/map/spatial'
-import { appendSpatialBatchFeatures, spatialColumnNames } from './features/map/spatialFeatures'
+import {
+  appendSpatialBatchFeatures,
+  selectMapPropertyColumns,
+  spatialColumnNames,
+} from './features/map/spatialFeatures'
 import { SchemaPanel } from './features/schema/SchemaPanel'
 import { TablePanel } from './features/table/TablePanel'
-import type { DatasetInfo, FilterClause, MapSnapshotSpec } from './types'
+import type { DatasetInfo, FilterClause } from './types'
 
 type Tab = 'data' | 'map' | 'schema'
 type Theme = 'light' | 'dark'
 
 export default function App() {
-  // Shared workspace state. These values affect more than one child component,
-  // so App is the lowest sensible common owner for them.
   const [uri, setUri] = useState('')
   const [dataset, setDataset] = useState<DatasetInfo | null>(null)
   const [tab, setTab] = useState<Tab>('data')
   const [offset, setOffset] = useState(0)
   const [limit, setLimit] = useState(1000)
-  const [rows, setRows] = useState<PlainRow[]>([])
+  const [pageRows, setPageRows] = useState<PlainRow[]>([])
   const [visibleColumns, setVisibleColumns] = useState<string[]>([])
   const [filters, setFilters] = useState<FilterClause[]>([])
-  const [totalRows, setTotalRows] = useState<number | null>(null)
-  const [countLoading, setCountLoading] = useState(false)
+  const [loadAll, setLoadAll] = useState(false)
   const [loading, setLoading] = useState(false)
   const [opening, setOpening] = useState(false)
   const [error, setError] = useState('')
   const [theme, setTheme] = useState<Theme>(getInitialTheme)
-  const [mapSnapshot, setMapSnapshot] = useState<MapSnapshotSpec | null>(null)
-  const [mapPageFeatures, setMapPageFeatures] = useState<Feature[]>([])
-  const [mapSnapshotSeed, setMapSnapshotSeed] = useState<Feature[]>([])
-  // Request IDs are monotonic guards against stale async results. A valid old
-  // response must not overwrite state produced by a newer user action.
-  const pageRequestId = useRef(0)
-  const mapSnapshotId = useRef(0)
 
-  // All viewer features report progress through one shared trace lifecycle.
+  // The canonical complete-result cache stays in Arrow form. Table pages are
+  // materialized only when displayed, and Map decodes these same batches only
+  // when the map is actually opened. This avoids duplicating the whole result
+  // into JavaScript row objects up front.
+  const fullBatchesRef = useRef<RecordBatch[]>([])
+  const fullMapFeaturesRef = useRef<Feature[]>([])
+  const fullMapDecodedBatchCountRef = useRef(0)
+  const fullMapDecodedRowsRef = useRef(0)
+  const fullMapLastPublishedRowsRef = useRef(0)
+  const fullMapLastDiagnosticAtRef = useRef(0)
+  const fullResultTraceIdRef = useRef<string | null>(null)
+  const [fullRowsLoaded, setFullRowsLoaded] = useState(0)
+  const [fullResultComplete, setFullResultComplete] = useState(false)
+  const [fullMapRevision, setFullMapRevision] = useState(0)
+
+  const [mapPageFeatures, setMapPageFeatures] = useState<Feature[]>([])
+  const [mapPageLoading, setMapPageLoading] = useState(false)
+  const [mapPageKey, setMapPageKey] = useState<string | null>(null)
+  const [mapPageRevision, setMapPageRevision] = useState(0)
+
+  // Request IDs are monotonic guards against stale async results. Abort signals
+  // stop obsolete full-result/page streams as soon as query state changes.
+  const pageRequestId = useRef(0)
+  const resultRequestId = useRef(0)
+  const mapPageRequestId = useRef(0)
+
   const {
     activity,
     beginActivity,
@@ -69,42 +85,149 @@ export default function App() {
     [dataset],
   )
 
-  // Synchronize React theme state with the document and persisted preference.
+  const fullResultActive = filters.length > 0 || loadAll
+  const fullPageRowsAvailable = Math.max(0, Math.min(limit, fullRowsLoaded - offset))
+  const displayedRows = useMemo(
+    () => fullResultActive
+      ? rowsFromCachedBatches(fullBatchesRef.current, offset, limit, visibleColumns)
+      : pageRows,
+    [fullResultActive, fullPageRowsAvailable, offset, limit, visibleColumns, pageRows],
+  )
+  const totalRows = fullResultActive
+    ? (fullResultComplete ? fullRowsLoaded : null)
+    : dataset?.num_rows ?? null
+
+  const currentPageKey = dataset
+    ? `${dataset.dataset_id}:${offset}:${limit}:${visibleColumns.join('|')}`
+    : ''
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     window.localStorage.setItem('parquet-viewer-theme', theme)
   }, [theme])
 
-  // Table queries are derived from dataset + paging + filters + projection.
-  // Changing any of those inputs invalidates the current page and triggers a read.
+  // Drop a complete-result cache as soon as the viewer returns to ordinary
+  // unfiltered paging. Arrow buffers can be large, so stale filtered/All data
+  // should not remain retained behind the scenes.
   useEffect(() => {
-    if (!dataset) return
-    void loadPage(dataset, offset, limit, visibleColumns)
-  }, [dataset?.dataset_id, offset, limit, filters, visibleColumns])
+    if (fullResultActive) return
+    fullBatchesRef.current = []
+    fullMapFeaturesRef.current = []
+    fullMapDecodedBatchCountRef.current = 0
+    fullMapDecodedRowsRef.current = 0
+    fullMapLastPublishedRowsRef.current = 0
+    fullMapLastDiagnosticAtRef.current = 0
+    fullResultTraceIdRef.current = null
+    setFullRowsLoaded(0)
+    setFullResultComplete(false)
+    setFullMapRevision(value => value + 1)
+  }, [dataset?.dataset_id, fullResultActive])
 
-  // The unfiltered row count comes from footer metadata. Filtered counts require
-  // a backend query and are kept separate from page loading.
+  // Ordinary unfiltered exploration stays server-paged. Changing page or page
+  // size therefore issues one bounded /page request.
   useEffect(() => {
-    if (!dataset) return
-    if (filters.length === 0) {
-      setTotalRows(dataset.num_rows)
-      setCountLoading(false)
+    if (!dataset || fullResultActive) return
+    const controller = new AbortController()
+    void loadPage(dataset, offset, limit, visibleColumns, controller.signal)
+    return () => controller.abort()
+  }, [dataset?.dataset_id, fullResultActive, offset, limit, visibleColumns])
+
+  // A filtered result (or explicit All) is streamed once. Local table paging
+  // does not appear in this dependency list, so Previous/Next never re-query
+  // Parquet while this cache is active.
+  useEffect(() => {
+    if (!dataset || !fullResultActive) return
+    const controller = new AbortController()
+    void loadFullResult(dataset, visibleColumns, controller.signal)
+    return () => controller.abort()
+  }, [dataset?.dataset_id, fullResultActive, filters, visibleColumns])
+
+  // In ordinary unfiltered paging, coordinate columns are usually already part
+  // of the page query. A large WKB geometry column is deliberately fetched only
+  // when the user actually opens Map, avoiding hidden geometry I/O in Table.
+  useEffect(() => {
+    if (
+      !dataset
+      || !spatialSource
+      || fullResultActive
+      || tab !== 'map'
+      || mapPageKey === currentPageKey
+    ) return
+
+    const controller = new AbortController()
+    void loadCurrentPageMap(dataset, controller.signal)
+    return () => controller.abort()
+  }, [dataset?.dataset_id, spatialSource, fullResultActive, tab, currentPageKey, mapPageKey])
+
+  // Full filtered/All results keep Arrow batches as the shared cache. Decode
+  // spatial features only while Map is open, and only for batches not already
+  // processed. This preserves one backend query without forcing WKB -> GeoJSON
+  // work on users who stay in Table.
+  useEffect(() => {
+    if (!dataset || !spatialSource || !fullResultActive || tab !== 'map') return
+
+    const batches = fullBatchesRef.current
+    const firstBatch = fullMapDecodedBatchCountRef.current
+    if (firstBatch >= batches.length) {
+      // Completion can arrive after the last batch was decoded but before the
+      // 50k publish threshold was reached. Always publish that final tail.
+      if (
+        fullResultComplete
+        && fullMapLastPublishedRowsRef.current !== fullMapDecodedRowsRef.current
+      ) {
+        fullMapLastPublishedRowsRef.current = fullMapDecodedRowsRef.current
+        setFullMapRevision(value => value + 1)
+      }
       return
     }
 
-    let cancelled = false
-    setCountLoading(true)
-    setTotalRows(null)
+    const spatialSet = new Set(spatialColumnNames(spatialSource))
+    const propertyColumns = visibleColumns.filter(name => !spatialSet.has(name)).slice(0, 8)
+    const started = performance.now()
+    for (let index = firstBatch; index < batches.length; index += 1) {
+      const batch = batches[index]
+      appendSpatialBatchFeatures(
+        batch,
+        spatialSource,
+        propertyColumns,
+        fullMapFeaturesRef.current,
+        fullMapDecodedRowsRef.current,
+      )
+      fullMapDecodedRowsRef.current += batch.numRows
+      fullMapDecodedBatchCountRef.current = index + 1
+    }
 
-    void countRows(dataset.dataset_id, filters)
-      .then(count => { if (!cancelled) setTotalRows(count) })
-      .catch(err => { if (!cancelled) setError(String(err)) })
-      .finally(() => { if (!cancelled) setCountLoading(false) })
+    const decodeMs = performance.now() - started
+    const decodedRows = fullMapDecodedRowsRef.current
+    const shouldPublish = fullMapLastPublishedRowsRef.current === 0
+      || decodedRows - fullMapLastPublishedRowsRef.current >= 50_000
+      || (fullResultComplete && fullMapDecodedBatchCountRef.current === batches.length)
 
-    return () => { cancelled = true }
-  }, [dataset?.dataset_id, filters])
+    if (shouldPublish) {
+      fullMapLastPublishedRowsRef.current = decodedRows
+      setFullMapRevision(value => value + 1)
+    }
 
-  /** Open a URL and reset all dataset-dependent UI state around the new handle. */
+    const traceId = fullResultTraceIdRef.current
+    const now = performance.now()
+    if (
+      traceId
+      && (fullMapLastDiagnosticAtRef.current === 0
+        || now - fullMapLastDiagnosticAtRef.current >= 1_000
+        || fullResultComplete)
+    ) {
+      addClientActivity(
+        traceId,
+        spatialSource.kind === 'geometry' ? 'Decoding WKB geometries' : 'Building coordinate geometries',
+        `${fullMapFeaturesRef.current.length.toLocaleString()} features from ${decodedRows.toLocaleString()} cached rows`,
+        undefined,
+        decodeMs,
+      )
+      fullMapLastDiagnosticAtRef.current = now
+    }
+  }, [dataset?.dataset_id, spatialSource, fullResultActive, tab, fullRowsLoaded, fullResultComplete, visibleColumns])
+
+  /** Open a URL and reset all dataset-dependent browser state. */
   async function onOpen(event: FormEvent) {
     event.preventDefault()
     if (!uri.trim()) return
@@ -116,26 +239,33 @@ export default function App() {
 
     try {
       if (dataset) {
-        // Dataset IDs are temporary backend handles. Close the previous one
-        // when changing URLs, but keep this best-effort: the backend idle TTL
-        // also cleans it up if the browser disappears or this request fails.
+        // Dataset IDs are temporary backend handles. Explicit close is a fast
+        // cleanup path; backend idle expiry handles browser crashes/refreshes.
         await closeDataset(dataset.dataset_id).catch(() => undefined)
       }
 
-      // `/datasets/open` generates a fresh process-local handle. Store the full
-      // DatasetInfo because every later feature uses `dataset.dataset_id`.
       const info = await openDataset(uri.trim(), undefined, traceId)
       addClientActivity(traceId, 'Preparing the viewer', `${info.columns.length} fields found`)
 
+      fullBatchesRef.current = []
+      fullMapFeaturesRef.current = []
+      fullMapDecodedBatchCountRef.current = 0
+      fullMapDecodedRowsRef.current = 0
+      fullMapLastPublishedRowsRef.current = 0
+      fullMapLastDiagnosticAtRef.current = 0
+      fullResultTraceIdRef.current = null
       setDataset(info)
       setOffset(0)
       setFilters([])
-      setRows([])
+      setLoadAll(false)
+      setPageRows([])
       setVisibleColumns(info.columns.map(column => column.name))
-      setTotalRows(info.num_rows)
-      setMapSnapshot(null)
+      setFullRowsLoaded(0)
+      setFullResultComplete(false)
+      setFullMapRevision(0)
       setMapPageFeatures([])
-      setMapSnapshotSeed([])
+      setMapPageKey(null)
+      setMapPageRevision(0)
       setTab('data')
       finishActivity(traceId, 'File opened', `${info.num_rows.toLocaleString()} rows ready to explore`)
     } catch (err) {
@@ -146,24 +276,20 @@ export default function App() {
     }
   }
 
-  /**
-   * Stream one table page as Arrow batches.
-   *
-   * The backend projection follows visibleColumns, while extra spatial columns
-   * may be requested only when they enable the lightweight map preview.
-   */
+  /** Stream one bounded unfiltered table page from the backend. */
   async function loadPage(
     info: DatasetInfo,
     pageOffset: number,
     pageLimit: number,
     pageColumns: string[],
+    signal: AbortSignal,
   ) {
     const requestId = ++pageRequestId.current
     const traceId = makeTraceId('page')
-
     const pageSpatialSource = detectSpatialSource(info)
-    // Keep coordinate pairs available for a fast map preview. Large WKB geometry
-    // stays out of the table projection unless it is already visible.
+
+    // Coordinates are cheap enough to keep with the current page so Map can
+    // open instantly. WKB is included here only when already visible in Table.
     const requiredSpatialColumns = pageSpatialSource?.kind === 'coordinates'
       ? spatialColumnNames(pageSpatialSource)
       : pageSpatialSource && pageColumns.includes(pageSpatialSource.geometry.name)
@@ -171,14 +297,20 @@ export default function App() {
         : []
     const requestColumns = [...new Set([...pageColumns, ...requiredSpatialColumns])]
 
+    setMapPageFeatures([])
+    setMapPageKey(null)
+
     if (requestColumns.length === 0) {
-      setRows([])
-      setMapPageFeatures([])
+      setPageRows([])
       setLoading(false)
       return
     }
 
-    beginActivity(traceId, 'Loading rows', `Fetching rows ${(pageOffset + 1).toLocaleString()}–${(pageOffset + pageLimit).toLocaleString()}`)
+    beginActivity(
+      traceId,
+      'Loading rows',
+      `Fetching rows ${(pageOffset + 1).toLocaleString()}–${(pageOffset + pageLimit).toLocaleString()}`,
+    )
     setLoading(true)
     setError('')
 
@@ -197,7 +329,7 @@ export default function App() {
             columns: requestColumns,
             offset: pageOffset,
             limit: pageLimit,
-            filters,
+            filters: [],
           },
           diagnostic => addClientActivity(
             traceId,
@@ -206,10 +338,11 @@ export default function App() {
             undefined,
             diagnostic.durationMs,
           ),
+          signal,
         )
       ) {
         const tableDecodeStarted = performance.now()
-        nextRows.push(...batchRows(batch, pageLimit - nextRows.length))
+        nextRows.push(...batchRows(batch, pageLimit - nextRows.length, pageColumns))
         addClientActivity(
           traceId,
           'Building table rows',
@@ -218,7 +351,7 @@ export default function App() {
           performance.now() - tableDecodeStarted,
         )
 
-        if (pageSpatialSource) {
+        if (pageSpatialSource && requiredSpatialColumns.length > 0) {
           const featureCountBefore = nextMapFeatures.length
           const geometryStarted = performance.now()
           appendSpatialBatchFeatures(
@@ -236,67 +369,207 @@ export default function App() {
             performance.now() - geometryStarted,
           )
         }
+
         rowsRead += batch.numRows
         if (nextRows.length >= pageLimit) break
       }
 
-      if (pageSpatialSource && nextMapFeatures.length > 0) {
-        addClientActivity(
-          traceId,
-          'Preparing map preview',
-          `${nextMapFeatures.length.toLocaleString()} geometries ready`,
-          0.98,
-        )
-      }
+      if (signal.aborted || requestId !== pageRequestId.current) return
 
-      if (requestId === pageRequestId.current) {
-        setRows(nextRows)
+      setPageRows(nextRows)
+      if (pageSpatialSource && requiredSpatialColumns.length > 0) {
         setMapPageFeatures(nextMapFeatures)
-        finishActivity(
-          traceId,
-          'Rows ready',
-          `${nextRows.length.toLocaleString()} rows loaded into the table`,
-        )
+        setMapPageKey(currentPageKeyFor(info.dataset_id, pageOffset, pageLimit, pageColumns))
+        setMapPageRevision(value => value + 1)
       }
+      finishActivity(traceId, 'Rows ready', `${nextRows.length.toLocaleString()} rows loaded into the table`)
     } catch (err) {
+      if (signal.aborted) return
       if (requestId === pageRequestId.current) {
         setMapPageFeatures([])
+        setMapPageKey(null)
         failActivity(traceId, 'Loading rows failed')
         setError(String(err))
       }
     } finally {
-      if (requestId === pageRequestId.current) setLoading(false)
+      if (!signal.aborted && requestId === pageRequestId.current) setLoading(false)
     }
   }
 
-  /** Freeze the current filter/count state into a map snapshot specification. */
-  function switchToMap() {
-    if (!dataset || !spatialSource || totalRows == null || countLoading) return
+  /**
+   * Stream the complete current result once and keep it in the browser.
+   *
+   * Filters automatically use this path. The explicit All option uses the same
+   * path with no filters. Table Previous/Next only slices this cache afterward.
+   */
+  async function loadFullResult(
+    info: DatasetInfo,
+    tableColumns: string[],
+    signal: AbortSignal,
+  ) {
+    const requestId = ++resultRequestId.current
+    const traceId = makeTraceId(filters.length ? 'filter' : 'all')
+    const resultSpatialSource = detectSpatialSource(info)
+    const spatialColumns = resultSpatialSource ? spatialColumnNames(resultSpatialSource) : []
+    const requested = [...new Set([...tableColumns, ...spatialColumns])]
+    const requestColumns = requested.length > 0
+      ? requested
+      : info.columns.slice(0, 1).map(column => column.name)
 
-    setMapSnapshotSeed(mapPageFeatures.slice())
-    setMapSnapshot({
-      id: ++mapSnapshotId.current,
-      filters: filters.map(filter => ({ ...filter })),
-      expectedRows: totalRows,
-    })
-    setTab('map')
+    fullBatchesRef.current = []
+    fullMapFeaturesRef.current = []
+    fullMapDecodedBatchCountRef.current = 0
+    fullMapDecodedRowsRef.current = 0
+    fullMapLastPublishedRowsRef.current = 0
+    fullMapLastDiagnosticAtRef.current = 0
+    fullResultTraceIdRef.current = traceId
+    setPageRows([])
+    setMapPageFeatures([])
+    setMapPageKey(null)
+    setFullRowsLoaded(0)
+    setFullResultComplete(false)
+    setFullMapRevision(value => value + 1)
+    setLoading(true)
+    setError('')
+
+    beginActivity(
+      traceId,
+      filters.length ? 'Loading filtered result' : 'Loading all rows',
+      filters.length ? 'Streaming all matching rows once' : 'Streaming the complete dataset',
+    )
+
+    try {
+      let rowsRead = 0
+      let lastProgressAt = 0
+
+      for await (
+        const batch of resultBatches(
+          info.dataset_id,
+          {
+            trace_id: traceId,
+            columns: requestColumns,
+            filters,
+          },
+          diagnostic => addClientActivity(
+            traceId,
+            diagnostic.message,
+            diagnostic.detail,
+            undefined,
+            diagnostic.durationMs,
+          ),
+          signal,
+        )
+      ) {
+        fullBatchesRef.current.push(batch)
+        rowsRead += batch.numRows
+        if (signal.aborted || requestId !== resultRequestId.current) return
+
+        // A row counter is enough to refresh local table paging. The Arrow
+        // batches themselves stay canonical until a visible page is rendered.
+        setFullRowsLoaded(rowsRead)
+
+        const now = performance.now()
+        if (lastProgressAt === 0 || now - lastProgressAt >= 1_000) {
+          addClientActivity(
+            traceId,
+            'Caching Arrow result',
+            `${rowsRead.toLocaleString()} rows · ${fullBatchesRef.current.length.toLocaleString()} batches`,
+          )
+          lastProgressAt = now
+        }
+      }
+
+      if (signal.aborted || requestId !== resultRequestId.current) return
+
+      setFullRowsLoaded(rowsRead)
+      setFullResultComplete(true)
+      finishActivity(
+        traceId,
+        filters.length ? 'Filtered result ready' : 'All rows loaded',
+        `${rowsRead.toLocaleString()} rows cached as Arrow batches`,
+      )
+    } catch (err) {
+      if (signal.aborted) return
+      if (requestId === resultRequestId.current) {
+        failActivity(traceId, filters.length ? 'Filtered result failed' : 'Loading all rows failed')
+        setError(String(err))
+      }
+    } finally {
+      if (!signal.aborted && requestId === resultRequestId.current) setLoading(false)
+    }
   }
 
-  function handleMapActivity(update: MapActivityUpdate) {
-    if (update.type === 'start') {
-      beginActivity(update.traceId, 'Loading map', update.message)
-      return
+  /** Fetch only the current unfiltered page's spatial data when Map needs it. */
+  async function loadCurrentPageMap(info: DatasetInfo, signal: AbortSignal) {
+    if (!spatialSource) return
+    const requestId = ++mapPageRequestId.current
+    const traceId = makeTraceId('map-page')
+    const propertyColumns = selectMapPropertyColumns(info, spatialSource, visibleColumns)
+    const columns = [...new Set([...spatialColumnNames(spatialSource), ...propertyColumns])]
+    const features: Feature[] = []
+    let rowsRead = 0
+
+    setMapPageLoading(true)
+    beginActivity(traceId, 'Loading map page', `Rows ${(offset + 1).toLocaleString()}–${(offset + limit).toLocaleString()}`)
+
+    try {
+      for await (
+        const batch of pageBatches(
+          info.dataset_id,
+          { trace_id: traceId, columns, offset, limit, filters: [] },
+          diagnostic => addClientActivity(
+            traceId,
+            diagnostic.message,
+            diagnostic.detail,
+            undefined,
+            diagnostic.durationMs,
+          ),
+          signal,
+        )
+      ) {
+        const geometryStarted = performance.now()
+        appendSpatialBatchFeatures(batch, spatialSource, propertyColumns, features, offset + rowsRead)
+        rowsRead += batch.numRows
+        addClientActivity(
+          traceId,
+          spatialSource.kind === 'geometry' ? 'Decoding WKB geometries' : 'Building coordinate geometries',
+          `${features.length.toLocaleString()} features from ${rowsRead.toLocaleString()} rows`,
+          Math.min(0.98, rowsRead / Math.max(1, limit)),
+          performance.now() - geometryStarted,
+        )
+      }
+
+      if (signal.aborted || requestId !== mapPageRequestId.current) return
+      setMapPageFeatures(features)
+      setMapPageKey(currentPageKey)
+      setMapPageRevision(value => value + 1)
+      finishActivity(traceId, 'Map page ready', `${features.length.toLocaleString()} geometries loaded`)
+    } catch (err) {
+      if (signal.aborted) return
+      if (requestId === mapPageRequestId.current) {
+        failActivity(traceId, 'Map page failed')
+        setError(String(err))
+      }
+    } finally {
+      if (!signal.aborted && requestId === mapPageRequestId.current) setMapPageLoading(false)
     }
-    if (update.type === 'progress') {
-      addClientActivity(update.traceId, update.message, update.detail, update.progress, update.durationMs)
-      return
-    }
-    if (update.type === 'complete') {
-      finishActivity(update.traceId, update.message, update.detail)
-      return
-    }
-    failActivity(update.traceId, update.message)
   }
+
+  const mapFeatures = fullResultActive ? fullMapFeaturesRef.current : mapPageFeatures
+  const mapRevision = fullResultActive ? fullMapRevision : mapPageRevision
+  const fullMapComplete = fullResultComplete
+    && fullMapDecodedBatchCountRef.current === fullBatchesRef.current.length
+  const mapRowsLoaded = fullResultActive ? fullMapDecodedRowsRef.current : pageRows.length
+  const mapLoading = fullResultActive ? (loading || !fullMapComplete) : mapPageLoading
+  const mapComplete = fullResultActive ? fullMapComplete : mapPageKey === currentPageKey
+  const mapScopeLabel = filters.length > 0
+    ? 'Filtered result'
+    : loadAll
+      ? 'All rows'
+      : `Current page · ${(offset + 1).toLocaleString()}–${Math.min(offset + limit, dataset?.num_rows ?? offset + limit).toLocaleString()}`
+  const mapDataKey = dataset
+    ? `${dataset.dataset_id}:${fullResultActive ? `full:${JSON.stringify(filters)}:${loadAll}` : currentPageKey}`
+    : ''
 
   return (
     <div className="app-shell">
@@ -341,20 +614,14 @@ export default function App() {
         <LandingPanel />
       ) : (
         <main className="workspace">
-          <DatasetSidebar
-            dataset={dataset}
-            spatialSource={spatialSource}
-            filters={filters}
-          />
+          <DatasetSidebar dataset={dataset} spatialSource={spatialSource} filters={filters} />
 
           <section className="content">
             <nav className="tabs">
-              <TabButton active={tab === 'data'} onClick={() => setTab('data')}>
-                Table
-              </TabButton>
+              <TabButton active={tab === 'data'} onClick={() => setTab('data')}>Table</TabButton>
               <TabButton
                 active={tab === 'map'}
-                disabled={!spatialSource || !mapSnapshot}
+                disabled={!spatialSource}
                 onClick={() => setTab('map')}
               >
                 Map
@@ -367,16 +634,17 @@ export default function App() {
             {tab === 'data' && (
               <TablePanel
                 dataset={dataset}
-                rows={rows}
+                rows={displayedRows}
                 filters={filters}
                 visibleColumns={visibleColumns}
                 offset={offset}
                 limit={limit}
                 totalRows={totalRows}
+                loadedRows={fullResultActive ? fullRowsLoaded : pageRows.length}
                 loading={loading}
-                countLoading={countLoading}
-                spatialSource={spatialSource}
-                mapSnapshot={mapSnapshot}
+                fullResult={fullResultActive}
+                fullResultComplete={fullResultComplete}
+                loadAll={loadAll}
                 onApplyFilters={next => {
                   setOffset(0)
                   setFilters(next)
@@ -390,11 +658,14 @@ export default function App() {
                   setOffset(0)
                   setLimit(next)
                 }}
-                onViewMap={switchToMap}
+                onLoadAllChange={next => {
+                  setOffset(0)
+                  setLoadAll(next)
+                }}
               />
             )}
 
-            {spatialSource && mapSnapshot && (
+            {spatialSource && (
               <section
                 className={`pane map-pane${tab === 'map' ? '' : ' pane-hidden'}`}
                 aria-hidden={tab !== 'map'}
@@ -402,11 +673,15 @@ export default function App() {
                 <MapPanel
                   dataset={dataset}
                   source={spatialSource}
-                  snapshot={mapSnapshot}
-                  seedFeatures={mapSnapshotSeed}
+                  features={mapFeatures}
+                  rowsLoaded={mapRowsLoaded}
+                  scopeLabel={mapScopeLabel}
+                  dataKey={mapDataKey}
+                  dataRevision={mapRevision}
+                  loading={mapLoading}
+                  complete={mapComplete}
                   theme={theme}
                   active={tab === 'map'}
-                  onActivity={handleMapActivity}
                 />
               </section>
             )}
@@ -419,17 +694,6 @@ export default function App() {
       )}
 
       <footer className="project-footer">
-        {/*<div className="project-footer-copy">
-          <strong>Parquet Viewer</strong>
-          <span>
-            Developed at the Flanders Marine Institute (VLIZ) in the context of EDITO2,
-            the Horizon Europe project advancing the European Digital Twin Ocean.
-          </span>
-          <span className="project-footer-funding">
-            Funded by the European Union under grant agreement No. 101227771.
-          </span>
-        </div>*/}
-
         <div className="project-footer-logos" aria-label="Project attribution">
           <a href="https://www.edito.eu/" target="_blank" rel="noreferrer">
             <img
@@ -444,11 +708,7 @@ export default function App() {
             rel="noreferrer"
             aria-label="Flanders Marine Institute (VLIZ)"
           >
-            <img
-              src="/vliz-logo.png"
-              className="footer-logo-vliz"
-              alt="VLIZ"
-            />
+            <img src="/vliz-logo.png" className="footer-logo-vliz" alt="VLIZ" />
           </a>
         </div>
       </footer>
@@ -468,11 +728,7 @@ function TabButton({
   children: ReactNode
 }) {
   return (
-    <button
-      className={active ? 'active' : ''}
-      disabled={disabled}
-      onClick={onClick}
-    >
+    <button className={active ? 'active' : ''} disabled={disabled} onClick={onClick}>
       {children}
     </button>
   )
@@ -495,4 +751,34 @@ function filename(uri: string) {
 function makeTraceId(prefix: string) {
   const random = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
   return `${prefix}-${random}`
+}
+
+function rowsFromCachedBatches(
+  batches: RecordBatch[],
+  offset: number,
+  limit: number,
+  columns: string[],
+): PlainRow[] {
+  const rows: PlainRow[] = []
+  let skip = offset
+  let remaining = limit
+
+  for (const batch of batches) {
+    if (remaining <= 0) break
+    if (skip >= batch.numRows) {
+      skip -= batch.numRows
+      continue
+    }
+
+    const next = batchRowsRange(batch, skip, remaining, columns)
+    rows.push(...next)
+    remaining -= next.length
+    skip = 0
+  }
+
+  return rows
+}
+
+function currentPageKeyFor(datasetId: string, offset: number, limit: number, columns: string[]) {
+  return `${datasetId}:${offset}:${limit}:${columns.join('|')}`
 }
