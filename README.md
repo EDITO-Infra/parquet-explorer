@@ -102,7 +102,7 @@ Milestones and measured durations are kept distinct so the UI does not infer tim
 Backend:
 
 ```bash
-cargo run --manifest-path src/server/Cargo.toml
+cargo run --manifest-path src/backend/Cargo.toml
 ```
 
 Frontend:
