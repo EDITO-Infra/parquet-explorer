@@ -2,7 +2,7 @@
 
 ## Role
 
-The Rust backend is the data engine for the viewer. It combines asynchronous remote reads, Parquet decoding, Arrow RecordBatches, filtering, diagnostics, and read-only analysis.
+The Rust backend is the data engine for the viewer. It combines asynchronous remote reads, Parquet decoding, Arrow RecordBatches, filtering, diagnostics, and read-only analysis. See [Installation and local setup](installation.md) for current tool requirements.
 
 Rust is useful here because the storage and Parquet/Arrow work can stay in one native asynchronous process without converting the dataset through an additional row-oriented representation.
 

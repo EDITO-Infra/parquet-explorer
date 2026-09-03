@@ -18,6 +18,7 @@ export default defineConfig({
         text: "Overview",
         items: [
           { text: "Documentation", link: "/" },
+          { text: "Installation", link: "/installation" },
           { text: "Architecture", link: "/architecture" }
         ]
       },

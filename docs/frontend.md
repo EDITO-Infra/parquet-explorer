@@ -2,7 +2,7 @@
 
 ## Role
 
-The frontend is the browser workspace for opening a dataset, exploring rows, inspecting schema/statistics, viewing the current result on a map, and seeing request progress/diagnostics.
+The frontend is the browser workspace for opening a dataset, exploring rows, inspecting schema/statistics, viewing the current result on a map, and seeing request progress/diagnostics. See [Installation and local setup](installation.md) for current tool requirements.
 
 Parquet reading and physical-layout interpretation remain backend responsibilities.
 

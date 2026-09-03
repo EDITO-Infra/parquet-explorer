@@ -97,25 +97,32 @@ Requests can carry a trace ID. Backend diagnostics record storage I/O, reader/Ar
 
 Milestones and measured durations are kept distinct so the UI does not infer timings from unrelated timestamps.
 
+## Installation
+
+Prerequisites:
+
+- Rust and Cargo **1.88+** — the latest stable Rust is recommended.
+- Node.js **20.19+ or 22.12+** with npm — the latest LTS release is recommended.
+- Optional: Docker with Compose support.
+
+From the repository root:
+
+```bash
+rustup update stable
+cargo fetch --manifest-path src/backend/Cargo.toml --locked
+npm ci --prefix src/frontend
+```
+
 ## Run
 
-Backend:
+Start the backend and frontend in separate terminals:
 
 ```bash
 cargo run --manifest-path src/backend/Cargo.toml
+npm run dev --prefix src/frontend
 ```
 
-Frontend:
-
-```bash
-cd src/frontend
-npm install
-npm run dev
-```
-
-Then open `http://localhost:5173`.
-
-Or run the containerized application:
+Open `http://localhost:5173`, or use Docker:
 
 ```bash
 docker compose up --build

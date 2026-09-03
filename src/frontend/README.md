@@ -1,6 +1,6 @@
 # Frontend developer guide
 
-The frontend is a thin React/TypeScript explorer over the Rust Parquet engine. For the project-specific architecture, see [`../../docs/frontend.md`](../../docs/frontend.md).
+The frontend is a thin React/TypeScript explorer over the Rust Parquet engine. For prerequisites and dependency installation, see [`../../docs/installation.md`](../../docs/installation.md). For the project-specific architecture, see [`../../docs/frontend.md`](../../docs/frontend.md).
 
 ## Source map
 
