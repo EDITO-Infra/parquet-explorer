@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::model::{FilterClause, FilterOp};
 
-use super::source::ReaderBuilder;
+use super::super::source::ReaderBuilder;
 
 /// Compile API filter clauses into Parquet-RS row predicates.
 ///
@@ -136,7 +136,7 @@ fn validate_operator(op: FilterOp, data_type: &DataType) -> Result<()> {
 /// Parquet reader's Arrow type. Arrow's cast kernels handle narrowing numeric
 /// types and temporal parsing, keeping request parsing independent of each
 /// concrete Arrow primitive type.
-fn json_scalar(value: &Value, data_type: &DataType) -> Result<Scalar<ArrayRef>, String> {
+pub(super) fn json_scalar(value: &Value, data_type: &DataType) -> Result<Scalar<ArrayRef>, String> {
     let source: ArrayRef = match value {
         Value::String(value) => Arc::new(StringArray::from(vec![Some(value.as_str())])),
         Value::Bool(value) => Arc::new(BooleanArray::from(vec![Some(*value)])),

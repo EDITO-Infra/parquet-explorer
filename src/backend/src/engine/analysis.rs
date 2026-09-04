@@ -23,25 +23,22 @@ use parquet::{
 
 use crate::model::{
     AnalysisFinding, AnalysisRecommendationsResponse, AnalysisSummaryResponse, ColumnAnalysis,
-    ColumnPagesAnalysis, ColumnsAnalysisResponse, DatasetInfo, PageAnalysis, PagesAnalysisQuery,
+    ColumnPagesAnalysis, ColumnsAnalysisResponse, PageAnalysis, PagesAnalysisQuery,
     PagesAnalysisResponse, QueryCostContributor, QueryCostRequest, QueryCostResponse,
     RowGroupAnalysis, RowGroupColumnAnalysis, RowGroupsAnalysisResponse,
 };
 
-use super::source::{builder_for_uri, builder_for_uri_with_options};
+use super::{CoreEngine, dataset::OpenedDataset, query::prune_query_row_groups};
 
 const MIB: u64 = 1024 * 1024;
 const LARGE_ROW_GROUP_BYTES: u64 = 128 * MIB;
 const MEDIUM_ROW_GROUP_BYTES: u64 = 64 * MIB;
 
 /// Build a cheap file-level layout summary from ordinary Parquet footer metadata.
-pub async fn summary(
-    dataset_id: &str,
-    uri: &str,
-    top_level_columns: usize,
-) -> Result<AnalysisSummaryResponse> {
-    let builder = builder_for_uri(uri).await?;
-    let metadata = builder.metadata();
+fn summary(dataset: &OpenedDataset) -> Result<AnalysisSummaryResponse> {
+    let dataset_id = dataset.info.dataset_id.as_str();
+    let top_level_columns = dataset.info.columns.len();
+    let metadata = dataset.reader_metadata.metadata().as_ref();
     let leaf_columns = metadata.file_metadata().schema_descr().num_columns();
 
     let mut compressed = 0u64;
@@ -107,10 +104,11 @@ pub async fn summary(
 
 /// Aggregate compressed/uncompressed size, encodings, codecs and statistics
 /// coverage for every Parquet leaf column across all row groups.
-pub async fn columns(dataset_id: &str, uri: &str) -> Result<ColumnsAnalysisResponse> {
-    let builder = builder_for_uri(uri).await?;
-    let metadata = builder.metadata();
-    Ok(columns_from_metadata(dataset_id, metadata))
+fn columns(dataset: &OpenedDataset) -> Result<ColumnsAnalysisResponse> {
+    Ok(columns_from_metadata(
+        &dataset.info.dataset_id,
+        dataset.reader_metadata.metadata().as_ref(),
+    ))
 }
 
 fn columns_from_metadata(dataset_id: &str, metadata: &ParquetMetaData) -> ColumnsAnalysisResponse {
@@ -178,9 +176,9 @@ fn columns_from_metadata(dataset_id: &str, metadata: &ParquetMetaData) -> Column
 }
 
 /// Return row-group and per-column-chunk metadata without reading any data pages.
-pub async fn row_groups(dataset_id: &str, uri: &str) -> Result<RowGroupsAnalysisResponse> {
-    let builder = builder_for_uri(uri).await?;
-    let metadata = builder.metadata();
+fn row_groups(dataset: &OpenedDataset) -> Result<RowGroupsAnalysisResponse> {
+    let dataset_id = dataset.info.dataset_id.as_str();
+    let metadata = dataset.reader_metadata.metadata().as_ref();
     let schema = metadata.file_metadata().schema_descr();
 
     let row_groups = metadata
@@ -237,13 +235,13 @@ pub async fn row_groups(dataset_id: &str, uri: &str) -> Result<RowGroupsAnalysis
 ///
 /// Unlike the other analysis endpoints this can issue additional object-store
 /// range reads. It still does not read or decode page payloads.
-pub async fn pages(
-    dataset_id: &str,
-    uri: &str,
+async fn pages(
+    dataset: &OpenedDataset,
     query: PagesAnalysisQuery,
 ) -> Result<PagesAnalysisResponse> {
+    let dataset_id = dataset.info.dataset_id.as_str();
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
-    let (builder, metrics) = builder_for_uri_with_options(uri, Some(options)).await?;
+    let (builder, metrics) = dataset.source.builder_with_options(options).await?;
     let metadata = builder.metadata();
     let schema = metadata.file_metadata().schema_descr();
 
@@ -336,17 +334,16 @@ pub async fn pages(
 /// For unfiltered queries, row groups are selected from offset/limit. For
 /// filtered queries, the estimate is intentionally conservative because the
 /// number/location of matches cannot be known from generic footer metadata.
-pub async fn query_cost(
-    dataset_id: &str,
-    uri: &str,
+fn query_cost(
+    dataset: &OpenedDataset,
     request: QueryCostRequest,
 ) -> Result<QueryCostResponse> {
+    let dataset_id = dataset.info.dataset_id.as_str();
     if request.limit == 0 {
         bail!("limit must be at least 1");
     }
 
-    let builder = builder_for_uri(uri).await?;
-    let metadata = builder.metadata();
+    let metadata = dataset.reader_metadata.metadata().as_ref();
     let schema = metadata.file_metadata().schema_descr();
 
     let projected = resolve_leaf_indices(metadata, request.columns.as_deref())?;
@@ -363,7 +360,7 @@ pub async fn query_cost(
 
     let filtered = !request.filters.is_empty();
     let row_groups = if filtered {
-        (0..metadata.num_row_groups()).collect::<Vec<_>>()
+        prune_query_row_groups(dataset, &request.filters)?.row_groups
     } else {
         row_groups_for_window(metadata, request.offset, request.limit)
     };
@@ -396,7 +393,7 @@ pub async fn query_cost(
         "Actual object-store bytes may differ when page indexes, caches, HTTP range coalescing, or predicate pushdown change what the reader fetches.".to_string(),
     ];
     if filtered {
-        warnings.push("Filters make this a conservative upper-bound estimate: any row group may need to be examined before enough matching rows are found.".to_string());
+        warnings.push("Filter estimates apply the same conservative row-group statistics pruning as query execution; exact row matches still require RowFilter evaluation.".to_string());
     }
 
     let column_chunks = read_leaves.len().saturating_mul(row_groups.len());
@@ -404,7 +401,7 @@ pub async fn query_cost(
     Ok(QueryCostResponse {
         dataset_id: dataset_id.to_string(),
         analysis_source: "parquet_footer",
-        estimate_kind: if filtered { "conservative_upper_bound" } else { "row_group_chunk_estimate" },
+        estimate_kind: if filtered { "statistics_pruned_upper_bound" } else { "row_group_chunk_estimate" },
         requested_rows: request.limit,
         requested_columns: projected.len(),
         row_groups,
@@ -416,13 +413,12 @@ pub async fn query_cost(
 }
 
 /// Produce read-only findings aimed at interactive/browser access patterns.
-pub async fn recommendations(
-    dataset_id: &str,
-    uri: &str,
-    info: &DatasetInfo,
+fn recommendations(
+    dataset: &OpenedDataset,
 ) -> Result<AnalysisRecommendationsResponse> {
-    let builder = builder_for_uri(uri).await?;
-    let metadata = builder.metadata();
+    let dataset_id = dataset.info.dataset_id.as_str();
+    let info = &dataset.info;
+    let metadata = dataset.reader_metadata.metadata().as_ref();
     let columns = columns_from_metadata(dataset_id, metadata);
     let rg_count = metadata.num_row_groups();
     let total_compressed = columns.compressed_data_bytes;
@@ -565,4 +561,48 @@ fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
 
 fn percent(part: u64, total: u64) -> f64 {
     if total == 0 { 0.0 } else { part as f64 * 100.0 / total as f64 }
+}
+
+
+impl CoreEngine {
+    pub async fn analysis_summary(&self, dataset_id: &str) -> Result<AnalysisSummaryResponse> {
+        let dataset = self.dataset(dataset_id)?;
+        summary(&dataset)
+    }
+
+    pub async fn analysis_columns(&self, dataset_id: &str) -> Result<ColumnsAnalysisResponse> {
+        let dataset = self.dataset(dataset_id)?;
+        columns(&dataset)
+    }
+
+    pub async fn analysis_row_groups(&self, dataset_id: &str) -> Result<RowGroupsAnalysisResponse> {
+        let dataset = self.dataset(dataset_id)?;
+        row_groups(&dataset)
+    }
+
+    pub async fn analysis_pages(
+        &self,
+        dataset_id: &str,
+        query: PagesAnalysisQuery,
+    ) -> Result<PagesAnalysisResponse> {
+        let dataset = self.dataset(dataset_id)?;
+        pages(&dataset, query).await
+    }
+
+    pub async fn analysis_query_cost(
+        &self,
+        dataset_id: &str,
+        request: QueryCostRequest,
+    ) -> Result<QueryCostResponse> {
+        let dataset = self.dataset(dataset_id)?;
+        query_cost(&dataset, request)
+    }
+
+    pub async fn analysis_recommendations(
+        &self,
+        dataset_id: &str,
+    ) -> Result<AnalysisRecommendationsResponse> {
+        let dataset = self.dataset(dataset_id)?;
+        recommendations(&dataset)
+    }
 }

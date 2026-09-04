@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{AsyncFileReader, MetadataSuffixFetch};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
@@ -83,17 +83,6 @@ impl ReadMetrics {
             returned_bytes: self.inner.returned_bytes.load(Ordering::Relaxed),
             io_ms: self.inner.io_nanos.load(Ordering::Relaxed) / 1_000_000,
         }
-    }
-
-    /// Start a fresh accounting window. Builder creation has already completed
-    /// its footer/schema reads before this is called, so subsequent counters are
-    /// data-column reads performed while polling RecordBatches.
-    pub fn reset(&self) {
-        self.inner.calls.store(0, Ordering::Relaxed);
-        self.inner.ranges.store(0, Ordering::Relaxed);
-        self.inner.requested_bytes.store(0, Ordering::Relaxed);
-        self.inner.returned_bytes.store(0, Ordering::Relaxed);
-        self.inner.io_nanos.store(0, Ordering::Relaxed);
     }
 }
 
@@ -215,42 +204,63 @@ impl MetadataSuffixFetch for &mut ObjectStoreReader {
 
 pub type ReaderBuilder = ParquetRecordBatchStreamBuilder<ObjectStoreReader>;
 
-pub async fn builder_for_uri(uri: &str) -> Result<ReaderBuilder> {
-    let (builder, _) = builder_for_uri_with_metrics(uri).await?;
-    Ok(builder)
+/// Parsed, reusable storage location for one opened dataset.
+///
+/// Keeping the object-store client and path alive avoids reparsing the URI and
+/// rebuilding the remote client for every table, filter, map, or analysis call.
+#[derive(Clone)]
+pub(super) struct DatasetSource {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    uri: String,
 }
 
-/// Open a Parquet source using the reader's default metadata options.
-///
-/// The returned [`ReadMetrics`] belongs to the underlying object-store reader,
-/// so callers can distinguish storage wait from Parquet decoding/reader work.
-pub async fn builder_for_uri_with_metrics(uri: &str) -> Result<(ReaderBuilder, ReadMetrics)> {
-    builder_for_uri_with_options(uri, None).await
+impl DatasetSource {
+    pub(super) fn reader(&self, metrics: ReadMetrics) -> ObjectStoreReader {
+        ObjectStoreReader::new(Arc::clone(&self.store), self.path.clone(), metrics)
+    }
+
+    pub(super) fn builder(
+        &self,
+        metadata: &ArrowReaderMetadata,
+        metrics: ReadMetrics,
+    ) -> ReaderBuilder {
+        ParquetRecordBatchStreamBuilder::new_with_metadata(
+            self.reader(metrics),
+            metadata.clone(),
+        )
+    }
+
+    pub(super) async fn builder_with_options(
+        &self,
+        options: ArrowReaderOptions,
+    ) -> Result<(ReaderBuilder, ReadMetrics)> {
+        let metrics = ReadMetrics::default();
+        let reader = self.reader(metrics.clone());
+        let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+            .await
+            .with_context(|| format!("could not open Parquet metadata: {}", self.uri))?;
+        Ok((builder, metrics))
+    }
 }
 
-/// Open a Parquet source with explicit Arrow metadata-reading options.
-///
-/// This is primarily used by the read-only analysis endpoints. Normal data
-/// queries keep page-index loading disabled because fetching page indexes is
-/// extra work that is not required to display a basic page of rows. The
-/// `/analysis/pages` endpoint opts in explicitly so it can inspect page
-/// locations without reading data-page payloads.
-pub async fn builder_for_uri_with_options(
+/// Parse a source once and load the Arrow/Parquet metadata that will be cached
+/// on the opened dataset handle.
+pub(super) async fn open_source(
     uri: &str,
-    options: Option<ArrowReaderOptions>,
-) -> Result<(ReaderBuilder, ReadMetrics)> {
+) -> Result<(DatasetSource, ArrowReaderMetadata, ReadMetrics)> {
     let url = Url::parse(uri).with_context(|| format!("invalid source URI: {uri}"))?;
     let (store, path) = object_store::parse_url(&url)
         .with_context(|| format!("unsupported or invalid object-store URI: {uri}"))?;
-    let store: Arc<dyn ObjectStore> = Arc::from(store);
+    let source = DatasetSource {
+        store: Arc::from(store),
+        path,
+        uri: uri.to_string(),
+    };
     let metrics = ReadMetrics::default();
-    let reader = ObjectStoreReader::new(store, path, metrics.clone());
-
-    let builder = match options {
-        Some(options) => ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await,
-        None => ParquetRecordBatchStreamBuilder::new(reader).await,
-    }
-    .with_context(|| format!("could not open Parquet metadata: {uri}"))?;
-
-    Ok((builder, metrics))
+    let mut reader = source.reader(metrics.clone());
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
+        .await
+        .with_context(|| format!("could not open Parquet metadata: {uri}"))?;
+    Ok((source, metadata, metrics))
 }

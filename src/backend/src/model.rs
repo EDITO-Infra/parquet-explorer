@@ -1,10 +1,8 @@
 //! Shared JSON request/response models for the backend API.
 //!
 //! These types intentionally contain data only. Query execution belongs in the
-//! engine and HTTP concerns belong in `api.rs`. Keeping the wire contract here
+//! engine and HTTP concerns belong in `api/`. Keeping the wire contract here
 //! makes endpoint behavior easier to review and document.
-
-use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +30,25 @@ pub struct DatasetInfo {
     pub columns: Vec<ColumnInfo>,
     pub geo_columns: Vec<GeoColumnInfo>,
     pub geo_parquet: Option<GeoParquetInfo>,
+    pub layout: DatasetLayoutSummary,
     pub capabilities: Capabilities,
+}
+
+
+/// Compact physical-layout information derived once from the Parquet footer.
+///
+/// Detailed row-group/page metadata stays server-side or behind the analysis
+/// endpoints; this summary is cheap enough to return with `/datasets/open`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DatasetLayoutSummary {
+    pub compressed_data_bytes: u64,
+    pub uncompressed_data_bytes: u64,
+    pub average_row_group_rows: Option<f64>,
+    pub average_row_group_compressed_bytes: Option<f64>,
+    pub largest_row_group_compressed_bytes: u64,
+    pub statistics_coverage: Option<f64>,
+    pub column_index_declared: bool,
+    pub offset_index_declared: bool,
 }
 
 /// User-facing schema information for one top-level Arrow field.
@@ -97,21 +113,6 @@ impl Default for Capabilities {
             export_parquet: true,
         }
     }
-}
-
-/// Process-local handle metadata for one opened dataset.
-///
-/// `DatasetEntry` does **not** contain Parquet row data. It only keeps the
-/// lightweight `DatasetInfo` plus monotonic timestamps used to expire abandoned
-/// browser handles. The engine refreshes `last_accessed_at` whenever an operation
-/// successfully resolves this handle.
-#[derive(Debug, Clone)]
-pub struct DatasetEntry {
-    pub info: DatasetInfo,
-    /// When this process first registered the handle. Used for lifecycle logs.
-    pub opened_at: Instant,
-    /// Most recent successful engine lookup of this handle.
-    pub last_accessed_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

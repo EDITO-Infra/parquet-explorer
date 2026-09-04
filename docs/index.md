@@ -6,6 +6,7 @@ This documentation explains the parts of the project that should remain useful e
 
 - [Installation and local setup](installation.md) — required Rust/Cargo and Node/npm versions, dependency installation, updates, and local run commands.
 - [Architecture](architecture.md) — system boundaries, request flow, and temporary dataset handles.
+- [API](API.md) — open a dataset and query, filter, stream, or export its rows.
 - [Engine](engine.md) — Rust backend responsibilities and the remote Parquet read path.
 - [Frontend](frontend.md) — frontend feature boundaries, shared state, and data flow.
 - [Parquet primer](parquet.md) — row groups, column chunks, pages, range reads, and read amplification.

@@ -11,10 +11,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --manifest-path src/server/Cargo.toml --all -- --check
-      - run: cargo check --manifest-path src/server/Cargo.toml
-      - run: cargo test --manifest-path src/server/Cargo.toml
-      - run: cargo clippy --manifest-path src/server/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path src/backend/Cargo.toml --all -- --check
+      - run: cargo check --manifest-path src/backend/Cargo.toml --locked
+      - run: cargo test --manifest-path src/backend/Cargo.toml --locked
+      - run: cargo clippy --manifest-path src/backend/Cargo.toml --all-targets --locked -- -D warnings
 
   frontend:
     runs-on: ubuntu-latest

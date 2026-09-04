@@ -34,6 +34,8 @@ The engine owns source validation/read access, Parquet query construction, filte
 
 Remote sources are read with byte ranges rather than downloaded eagerly. The source adapter also records I/O measurements used by diagnostics.
 
+Private and special-use source addresses are blocked by default as an SSRF defense. Because the HTTP client resolves the hostname again when connecting, exposed deployments should also enforce network-level egress controls.
+
 ## Dataset handles
 
 Opening a source creates a temporary server-side handle:

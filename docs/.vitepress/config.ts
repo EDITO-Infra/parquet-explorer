@@ -19,7 +19,8 @@ export default defineConfig({
         items: [
           { text: "Documentation", link: "/" },
           { text: "Installation", link: "/installation" },
-          { text: "Architecture", link: "/architecture" }
+          { text: "Architecture", link: "/architecture" },
+          { text: "API", link: "/API" }
         ]
       },
       {

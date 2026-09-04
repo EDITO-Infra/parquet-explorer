@@ -71,7 +71,7 @@ Base path: `/api/v1`.
 | `GET /diagnostics/{trace_id}` | request trace |
 | `DELETE /datasets/{id}` | close temporary dataset handle |
 
-See [`docs/ANALYSIS_API.md`](docs/ANALYSIS_API.md) for the analysis routes.
+See [`docs/API.md`](docs/API.md) for an end-to-end dataset query guide and [`docs/ANALYSIS_API.md`](docs/ANALYSIS_API.md) for the analysis routes.
 
 ## Result loading
 
