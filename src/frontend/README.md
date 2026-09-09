@@ -27,7 +27,7 @@ The backend analysis API is already available, but the interactive Analysis feat
 
 ## Result loading
 
-Unfiltered table browsing uses bounded backend pages. Applying filters switches to one complete filtered Arrow stream, cached in the browser and paged locally. **All** deliberately does the same without filters. The table page size remains capped at 10,000 rows. Map consumes the current page or the same complete-result cache rather than issuing its own filtered scan.
+Unfiltered table browsing uses bounded backend pages. Applying filters switches to one complete filtered Arrow stream, cached in the browser and paged locally. **All** deliberately does the same without filters. The table page size remains capped at 500,000 rows. Map consumes the current page or the same complete-result cache rather than issuing its own filtered scan.
 
 ## Ownership rule
 

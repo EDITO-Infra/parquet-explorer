@@ -60,7 +60,7 @@ The aim is to avoid both a giant `App.tsx` and a large number of tiny components
 
 ## Table
 
-The table feature owns filter/projection controls, paging, and row rendering. Unfiltered browsing uses backend pages. Filtered results (and explicit **All**) are streamed once into a browser cache and table paging is then local, with a maximum visible page size of 10,000 rows. Column selection still controls the backend projection.
+The table feature owns filter/projection controls, paging, and row rendering. Unfiltered browsing uses backend pages. Filtered results (and explicit **All**) are streamed once into a browser cache and table paging is then local, with a maximum visible page size of 500,000 rows. Column selection still controls the backend projection.
 
 ## Map
 

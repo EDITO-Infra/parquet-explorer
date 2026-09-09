@@ -1,7 +1,7 @@
 /**
  * Table-tab presentation and interaction surface.
  *
- * Page size is always a display limit (maximum 10,000 rows). Unfiltered data
+ * Page size is always a display limit (maximum 500,000 rows). Unfiltered data
  * can stay backend-paged or explicitly switch to All. Filtered results are
  * always streamed once and paged locally from the browser cache.
  */
@@ -128,6 +128,8 @@ export function TablePanel({
               <option>1000</option>
               <option>5000</option>
               <option>10000</option>
+              <option>100000</option>
+              <option>500000</option>
             </select>
           </label>
         </div>

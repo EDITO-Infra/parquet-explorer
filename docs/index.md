@@ -12,6 +12,7 @@ This documentation explains the parts of the project that should remain useful e
 - [Parquet primer](parquet.md) — row groups, column chunks, pages, range reads, and read amplification.
 - [Analysis](analysis.md) — what the read-only analysis layer is intended to explain.
 - [Analysis API](ANALYSIS_API.md) — currently implemented analysis endpoints.
+- [Show & tell](show-and-tell.md) — an end-to-end walkthrough: backend internals, frontend API usage, why querying is fast, and improvement ideas.
 
 ## Project boundaries
 

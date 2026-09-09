@@ -35,7 +35,7 @@ async fn page(
     if payload.limit == 0 {
         return Err(ApiError::bad_request("limit must be at least 1"));
     }
-    let max_page_size = state.settings.max_page_size.min(10_000);
+    let max_page_size = state.settings.max_page_size.min(500_000);
     if payload.limit > max_page_size {
         return Err(ApiError::bad_request(format!(
             "limit must not exceed {max_page_size} rows per page"

@@ -72,7 +72,7 @@ The frontend sends a URL to `/datasets/open`. The backend validates the source a
 
 ### Table
 
-Unfiltered exploration uses bounded `/page` requests. Once filters are active, the backend streams the complete projected matching result through `/result` once and the browser pages that cache locally. Choosing **All** explicitly uses the same complete-result path without filters. Table page size remains capped at 10,000 rows.
+Unfiltered exploration uses bounded `/page` requests. Once filters are active, the backend streams the complete projected matching result through `/result` once and the browser pages that cache locally. Choosing **All** explicitly uses the same complete-result path without filters. Table page size remains capped at 500,000 rows.
 
 ### Map
 

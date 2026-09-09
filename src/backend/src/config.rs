@@ -59,7 +59,7 @@ impl Settings {
             local_data_root: PathBuf::from(
                 env::var("PV_LOCAL_DATA_ROOT").unwrap_or_else(|_| "/data".into()),
             ),
-            max_page_size: number("PV_MAX_PAGE_SIZE", 10_000)?,
+            max_page_size: number("PV_MAX_PAGE_SIZE", 500_000)?,
             max_spatial_features: number("PV_MAX_SPATIAL_FEATURES", 100_000)?,
             batch_size: number("PV_BATCH_SIZE", 8_192)?,
             max_open_datasets: number("PV_MAX_OPEN_DATASETS", 512)?,

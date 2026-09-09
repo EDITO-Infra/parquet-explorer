@@ -75,7 +75,7 @@ See [`docs/API.md`](docs/API.md) for an end-to-end dataset query guide and [`doc
 
 ## Result loading
 
-Unfiltered table exploration uses bounded `/page` reads. Applying filters streams the complete matching projected result once through `/result`; the browser then pages that cached result locally with a maximum table page size of 10,000 rows. Selecting **All** explicitly uses the same complete-result stream without filters. Map shows the current unfiltered page or reuses the filtered/All cache.
+Unfiltered table exploration uses bounded `/page` reads. Applying filters streams the complete matching projected result once through `/result`; the browser then pages that cached result locally with a maximum table page size of 500,000 rows. Selecting **All** explicitly uses the same complete-result stream without filters. Map shows the current unfiltered page or reuses the filtered/All cache.
 
 ## Dataset IDs
 
@@ -122,11 +122,15 @@ cargo run --manifest-path src/backend/Cargo.toml
 npm run dev --prefix src/frontend
 ```
 
-Open `http://localhost:5173`, or use Docker:
+Open `http://localhost:5173`
+
+Docker Compose
+
 
 ```bash
 docker compose up --build
 ```
+go to `http://localhost:3000`
 
 ## Common development commands
 
@@ -161,6 +165,10 @@ https://s3.waw3-1.cloudferro.com/emodnet/emodnet_biology/12639/marine_biodiversi
 ```
 
 `IMISDatasetId: 9064`
+
+Local dataset will fail
+
+https://www.lifewatch.be/etn/parquet/detections/RATJADA/RATJADA_detections.parquet
 
 ## Validation
 

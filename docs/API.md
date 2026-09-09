@@ -86,7 +86,7 @@ curl --fail --request POST \
   --output page.arrow
 ```
 
-The page limit must be between 1 and 10,000 rows (and may be lower if the backend is configured with a smaller `PV_MAX_PAGE_SIZE`). Global sorting is reserved by the request contract but is not currently implemented.
+The page limit must be between 1 and 500,000 rows (and may be lower if the backend is configured with a smaller `PV_MAX_PAGE_SIZE`). Global sorting is reserved by the request contract but is not currently implemented.
 
 ### Read the Arrow response in Python
 
