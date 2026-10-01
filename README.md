@@ -1,23 +1,25 @@
 # Parquet Explorer
 
-A read-only Parquet/GeoParquet explorer with a Rust backend and React/MapLibre frontend.
+An application to explore Parquet/Geoparquet files in your browser in either **tabular** view or **map** view (Geoparquet only).
+
+Point it at an HTTP(S)-hosted `.parquet` file for instant **tabular browsing** and, for GeoParquet, an **interactive map view**. Schema inspection, filtering, and request diagnostics included. Only the byte ranges you need are fetched, so multi-GB files open as fast as small ones.
+
+## Architecture
 
 ```text
-browser
-  ├─ table / schema / diagnostics / map
+Browser (React)
+  ├─ Table / Schema / Diagnostics / Map
   ├─ Arrow JS
   └─ MapLibre
        │ JSON control + metadata
-       │ Arrow IPC row streams
+       │ Arrow IPC streams
        ▼
-Rust API
-  ├─ ranged remote reads
-  ├─ Parquet -> Arrow
-  ├─ filtering / analysis
-  └─ request diagnostics
+Rust API (axum)
+  ├─ Ranged HTTP reads
+  ├─ Parquet → Arrow
+  ├─ Filtering & analysis
+  └─ Request diagnostics
 ```
-
-The viewer does not download or manage source files as application state. It opens remote HTTP(S) Parquet sources through temporary backend handles and reads the required byte ranges on demand.
 
 ## Authorship and funding
 
@@ -154,10 +156,6 @@ docs/             developer documentation
 deploy/           Docker image (Dockerfile, nginx config, start script)
 ```
 
-## Security
-
-A server that fetches user-provided URLs is an SSRF boundary. The application validates source URLs and rejects private/special-use targets by default. Production deployments should also enforce appropriate network-level egress restrictions.
-
 ## Test dataset
 
 A public dataset useful for local development and performance testing:
@@ -168,9 +166,9 @@ https://s3.waw3-1.cloudferro.com/emodnet/emodnet_biology/12639/marine_biodiversi
 
 `IMISDatasetId: 9064`
 
-Local dataset will fail
+## Security
 
-https://www.lifewatch.be/etn/parquet/detections/RATJADA/RATJADA_detections.parquet
+A server that fetches user-provided URLs is an SSRF boundary. The application validates source URLs and rejects private/special-use targets by default. Production deployments should also enforce appropriate network-level egress restrictions.
 
 ## Validation
 
