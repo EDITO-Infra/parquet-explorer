@@ -17,10 +17,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use parquet::errors::ParquetError;
 
-use super::{
-    source::ReadMetrics,
-    trace::TraceReporter,
-};
+use super::{source::ReadMetrics, trace::TraceReporter};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -116,7 +113,10 @@ where
 
             if batch_count == 1 {
                 let first_batch_wall_ms = millis(read_started.elapsed());
-                let storage = read_metrics.as_ref().map(ReadMetrics::snapshot).unwrap_or_default();
+                let storage = read_metrics
+                    .as_ref()
+                    .map(ReadMetrics::snapshot)
+                    .unwrap_or_default();
                 if let Some(trace) = &trace {
                     trace.event_with_duration(
                         "data_storage",
@@ -141,7 +141,11 @@ where
                     trace.event_with_detail(
                         "first_batch",
                         "First Arrow RecordBatch produced",
-                        format!("{} rows · {} total reader wait", batch.num_rows(), format_duration(first_batch_wall_ms)),
+                        format!(
+                            "{} rows · {} total reader wait",
+                            batch.num_rows(),
+                            format_duration(first_batch_wall_ms)
+                        ),
                     );
                 }
             }
@@ -191,7 +195,10 @@ where
         }
 
         if let Some(trace) = &trace {
-            let storage = read_metrics.as_ref().map(ReadMetrics::snapshot).unwrap_or_default();
+            let storage = read_metrics
+                .as_ref()
+                .map(ReadMetrics::snapshot)
+                .unwrap_or_default();
             trace.event_with_duration(
                 "data_storage_total",
                 "Storage I/O total",

@@ -7,9 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use parquet::{
-    arrow::arrow_reader::ArrowReaderMetadata,
-    basic::LogicalType,
-    file::metadata::ParquetMetaData,
+    arrow::arrow_reader::ArrowReaderMetadata, basic::LogicalType, file::metadata::ParquetMetaData,
 };
 use serde::Deserialize;
 
@@ -158,7 +156,7 @@ pub(super) fn build_dataset_info(
             geo_columns.push(GeoColumnInfo {
                 name: column_name.clone(),
                 logical_type: "WKB".to_string(),
-                crs: "OGC:CRS84".to_string(),
+                crs: column_metadata.normalized_crs(),
                 edge_interpolation: Some(
                     column_metadata
                         .edges
@@ -206,7 +204,9 @@ pub(super) fn build_dataset_info(
                     geo_columns.push(GeoColumnInfo {
                         name: primary.to_string(),
                         logical_type: "WKB".to_string(),
-                        crs: "OGC:CRS84".to_string(),
+                        crs: column_metadata
+                            .map(|column| column.normalized_crs())
+                            .unwrap_or_else(|| "OGC:CRS84".to_string()),
                         edge_interpolation: Some(
                             column_metadata
                                 .and_then(|column| column.edges.clone())
@@ -275,8 +275,7 @@ fn build_layout_summary(metadata: &ParquetMetaData) -> DatasetLayoutSummary {
     DatasetLayoutSummary {
         compressed_data_bytes,
         uncompressed_data_bytes,
-        average_row_group_rows: (row_groups > 0)
-            .then(|| rows as f64 / row_groups as f64),
+        average_row_group_rows: (row_groups > 0).then(|| rows as f64 / row_groups as f64),
         average_row_group_compressed_bytes: (row_groups > 0)
             .then(|| compressed_data_bytes as f64 / row_groups as f64),
         largest_row_group_compressed_bytes,
@@ -306,6 +305,37 @@ struct RawGeoColumnMetadata {
     bbox: Option<Vec<f64>>,
     #[serde(default)]
     epoch: Option<f64>,
+    /// GeoParquet 1.x: CRS is absent (default OGC:CRS84), a CRS string, or a
+    /// PROJJSON object. Raw value kept so both shapes can be normalized.
+    #[serde(default)]
+    crs: Option<serde_json::Value>,
+}
+
+impl RawGeoColumnMetadata {
+    fn normalized_crs(&self) -> String {
+        match &self.crs {
+            None | Some(serde_json::Value::Null) => "OGC:CRS84".to_string(),
+            Some(serde_json::Value::String(value)) => normalize_parquet_crs(Some(value)),
+            Some(serde_json::Value::Object(projjson)) => {
+                let id = projjson.get("id").and_then(|id| id.as_object());
+                let authority = id
+                    .and_then(|id| id.get("authority"))
+                    .and_then(|value| value.as_str());
+                let code = id
+                    .and_then(|id| id.get("code"))
+                    .and_then(|value| value.as_i64());
+                match (authority, code) {
+                    (Some(authority), Some(code)) => format!("{authority}:{code}"),
+                    _ => projjson
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("OGC:CRS84")
+                        .to_string(),
+                }
+            }
+            Some(_) => "OGC:CRS84".to_string(),
+        }
+    }
 }
 
 fn parse_geo_metadata(metadata: &ParquetMetaData) -> Result<Option<RawGeoMetadata>> {

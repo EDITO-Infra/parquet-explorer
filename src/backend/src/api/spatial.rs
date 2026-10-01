@@ -41,7 +41,7 @@ async fn spatial(
     Ok(streaming_arrow_response(
         stream,
         Some((
-            "x-parquet-viewer-spatial-filter",
+            "x-parquet-explorer-spatial-filter",
             "row-group-bbox-candidates",
         )),
     ))

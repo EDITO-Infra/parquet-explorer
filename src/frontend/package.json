@@ -1,5 +1,5 @@
 {
-  "name": "parquet-viewer-frontend",
+  "name": "parquet-explorer-frontend",
   "private": true,
   "version": "0.2.0",
   "type": "module",
@@ -10,16 +10,19 @@
   },
   "dependencies": {
     "apache-arrow": "^21.2.0",
+    "lz4js": "^0.2.0",
     "maplibre-gl": "^6.0.0",
+    "proj4": "^2.19.10",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
+    "@types/geojson": "^7946.0.16",
+    "@types/proj4": "^2.5.6",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.1.9",
     "@vitejs/plugin-react": "^5.0.2",
     "typescript": "^5.9.2",
-    "vite": "^7.1.3",
-    "@types/geojson": "^7946.0.16"
+    "vite": "^7.1.3"
   }
 }

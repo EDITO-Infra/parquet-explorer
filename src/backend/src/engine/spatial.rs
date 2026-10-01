@@ -22,9 +22,11 @@ impl CoreEngine {
         dataset_id: &str,
         mut req: SpatialRequest,
     ) -> Result<IpcByteStream> {
-        let trace = self
-            .traces
-            .start(req.trace_id.as_deref(), "spatial", "Preparing spatial query");
+        let trace = self.traces.start(
+            req.trace_id.as_deref(),
+            "spatial",
+            "Preparing spatial query",
+        );
         validate_bbox(req.bbox)?;
         let dataset = self.dataset(dataset_id)?;
         if let Some(trace) = &trace {
@@ -179,14 +181,8 @@ mod tests {
 
     #[test]
     fn bbox_intersection_includes_touching_edges() {
-        assert!(bbox_intersects(
-            [0.0, 0.0, 1.0, 1.0],
-            [1.0, 1.0, 2.0, 2.0]
-        ));
-        assert!(!bbox_intersects(
-            [0.0, 0.0, 1.0, 1.0],
-            [1.1, 1.1, 2.0, 2.0]
-        ));
+        assert!(bbox_intersects([0.0, 0.0, 1.0, 1.0], [1.0, 1.0, 2.0, 2.0]));
+        assert!(!bbox_intersects([0.0, 0.0, 1.0, 1.0], [1.1, 1.1, 2.0, 2.0]));
     }
 
     #[test]

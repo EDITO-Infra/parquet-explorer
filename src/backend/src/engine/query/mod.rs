@@ -32,9 +32,11 @@ impl CoreEngine {
         dataset_id: &str,
         req: ResultRequest,
     ) -> Result<IpcByteStream> {
-        let trace = self
-            .traces
-            .start(req.trace_id.as_deref(), "result", "Preparing complete result");
+        let trace = self.traces.start(
+            req.trace_id.as_deref(),
+            "result",
+            "Preparing complete result",
+        );
         let dataset = self.dataset(dataset_id)?;
         if let Some(trace) = &trace {
             trace.event("dataset_found", "Dataset handle found");
@@ -57,8 +59,8 @@ impl CoreEngine {
             builder = builder.with_row_groups(pruning.row_groups);
         }
         let builder = apply_filters(builder, &req.filters)?;
-        let builder = apply_projection(builder, req.columns.as_deref())?
-            .with_batch_size(self.batch_size);
+        let builder =
+            apply_projection(builder, req.columns.as_deref())?.with_batch_size(self.batch_size);
         if let Some(trace) = &trace {
             trace.event("reader_ready", "Reader plan ready");
         }

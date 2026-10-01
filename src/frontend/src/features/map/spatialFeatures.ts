@@ -10,6 +10,7 @@ import type { Feature, Geometry } from 'geojson'
 import { plainValue } from '../../lib/arrow'
 import type { DatasetInfo } from '../../types'
 import type { SpatialSource } from './spatial'
+import { makeCoordTransform, transformGeometry } from './crs'
 import { parseWkb } from './wkb'
 
 export function spatialColumnNames(source: SpatialSource): string[] {
@@ -92,6 +93,7 @@ export function appendSpatialBatchFeatures(
 
   const geometryVector = batch.getChild(source.geometry.name)
   if (!geometryVector) return
+  const transform = makeCoordTransform(source.geometry.crs)
 
   for (let row = 0; row < batch.numRows; row += 1) {
     const bytes = geometryVector.get(row)
@@ -104,7 +106,10 @@ export function appendSpatialBatchFeatures(
     const properties = batchProperties(batch, propertyColumns, row)
     properties.__pv_result_row = resultRow + 1
 
-    renderableGeometries(parsed).forEach((geometry, partIndex) => {
+    renderableGeometries(parsed).forEach((rawGeometry, partIndex) => {
+      const geometry = transform
+        ? transformGeometry(rawGeometry, transform)
+        : rawGeometry
       features.push({
         type: 'Feature',
         id: `${resultRow}:${partIndex}`,
