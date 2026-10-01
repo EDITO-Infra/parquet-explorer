@@ -13,7 +13,7 @@ use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 
 use crate::model::{FilterClause, FilterOp};
 
-use super::{filter::json_scalar, super::dataset::OpenedDataset};
+use super::{super::dataset::OpenedDataset, filter::json_scalar};
 
 #[derive(Debug)]
 pub(crate) struct PruningResult {
@@ -44,16 +44,13 @@ pub(crate) fn prune_row_groups(
             continue;
         }
 
-        let converter = match StatisticsConverter::try_new(
-            &clause.column,
-            arrow_schema,
-            parquet_schema,
-        ) {
-            Ok(converter) => converter.with_missing_null_counts_as_zero(false),
-            // Exact filter compilation reports unknown/unsupported columns. For
-            // pruning, inability to interpret statistics must stay conservative.
-            Err(_) => continue,
-        };
+        let converter =
+            match StatisticsConverter::try_new(&clause.column, arrow_schema, parquet_schema) {
+                Ok(converter) => converter.with_missing_null_counts_as_zero(false),
+                // Exact filter compilation reports unknown/unsupported columns. For
+                // pruning, inability to interpret statistics must stay conservative.
+                Err(_) => continue,
+            };
 
         let rejected = match clause.op {
             FilterOp::IsNull => match prune_is_null(&converter, metadata) {
@@ -128,10 +125,10 @@ fn prune_comparison(
     let max_eq = cmp::eq(&maxes, scalar)?;
 
     let mut rejected = vec![false; metadata.num_row_groups()];
-    for index in 0..rejected.len() {
+    for (index, is_rejected) in rejected.iter_mut().enumerate() {
         let exact_min = bool_value(&min_exact, index).unwrap_or(false);
         let exact_max = bool_value(&max_exact, index).unwrap_or(false);
-        rejected[index] = match op {
+        *is_rejected = match op {
             FilterOp::Eq => {
                 (exact_min && bool_value(&min_gt, index).unwrap_or(false))
                     || (exact_max && bool_value(&max_lt, index).unwrap_or(false))
@@ -158,9 +155,7 @@ fn prune_is_null(
 ) -> Result<Vec<bool>> {
     let null_counts = converter.row_group_null_counts(metadata.row_groups().iter())?;
     Ok((0..metadata.num_row_groups())
-        .map(|index| {
-            null_counts.is_valid(index) && null_counts.value(index) == 0
-        })
+        .map(|index| null_counts.is_valid(index) && null_counts.value(index) == 0)
         .collect())
 }
 
@@ -175,7 +170,8 @@ fn prune_is_not_null(
         .enumerate()
         .map(|(index, row_group)| {
             null_counts.is_valid(index)
-                && null_counts.value(index) == u64::try_from(row_group.num_rows()).unwrap_or(u64::MAX)
+                && null_counts.value(index)
+                    == u64::try_from(row_group.num_rows()).unwrap_or(u64::MAX)
         })
         .collect())
 }

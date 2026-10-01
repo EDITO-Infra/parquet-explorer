@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Parquet Viewer is a portable, read-only explorer for remote Parquet and GeoParquet data. The browser handles interaction and presentation; a Rust service handles remote storage access, Parquet reading, filtering, analysis, and Arrow IPC streaming.
+Parquet Explorer is a portable, read-only explorer for remote Parquet and GeoParquet data. The browser handles interaction and presentation; a Rust service handles remote storage access, Parquet reading, filtering, analysis, and Arrow IPC streaming.
 
 ```text
 Remote Parquet object
@@ -56,7 +56,7 @@ A handle contains the validated URI and lightweight dataset metadata. It does **
 The handle is process-local and intentionally temporary:
 
 - each successful lookup refreshes its idle timestamp;
-- idle handles expire after `PV_DATASET_IDLE_TIMEOUT_SECONDS` (default 3600 seconds; `0` disables expiry);
+- idle handles expire after `PE_DATASET_IDLE_TIMEOUT_SECONDS` (default 3600 seconds; `0` disables expiry);
 - a periodic cleanup task removes abandoned handles;
 - the frontend best-effort closes the previous handle when another URL is opened;
 - a server restart clears all handles;

@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(settings.bind).await?;
-    tracing::info!(address = %settings.bind, "parquet-viewer-backend listening");
+    tracing::info!(address = %settings.bind, "parquet-explorer-backend listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

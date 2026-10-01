@@ -55,7 +55,11 @@ fn summary(dataset: &OpenedDataset) -> Result<AnalysisSummaryResponse> {
         compressed = compressed.saturating_add(row_group_compressed);
         uncompressed = uncompressed.saturating_add(nonnegative_i64(row_group.total_byte_size()));
         largest_row_group = largest_row_group.max(row_group_compressed);
-        row_groups_with_sorting += if row_group.sorting_columns().is_some() { 1 } else { 0 };
+        row_groups_with_sorting += if row_group.sorting_columns().is_some() {
+            1
+        } else {
+            0
+        };
 
         for column in row_group.columns() {
             chunks_total += 1;
@@ -113,10 +117,9 @@ fn columns(dataset: &OpenedDataset) -> Result<ColumnsAnalysisResponse> {
 
 fn columns_from_metadata(dataset_id: &str, metadata: &ParquetMetaData) -> ColumnsAnalysisResponse {
     let schema = metadata.file_metadata().schema_descr();
-    let total_compressed = metadata
-        .row_groups()
-        .iter()
-        .fold(0u64, |total, rg| total.saturating_add(nonnegative_i64(rg.compressed_size())));
+    let total_compressed = metadata.row_groups().iter().fold(0u64, |total, rg| {
+        total.saturating_add(nonnegative_i64(rg.compressed_size()))
+    });
 
     let mut output = Vec::with_capacity(schema.num_columns());
     for (leaf_index, descriptor) in schema.columns().iter().enumerate() {
@@ -138,7 +141,11 @@ fn columns_from_metadata(dataset_id: &str, metadata: &ParquetMetaData) -> Column
             codecs.insert(format!("{:?}", chunk.compression()));
             encodings.extend(chunk.encodings().map(|encoding| format!("{encoding:?}")));
             statistics += if chunk.statistics().is_some() { 1 } else { 0 };
-            geo_statistics += if chunk.geo_statistics().is_some() { 1 } else { 0 };
+            geo_statistics += if chunk.geo_statistics().is_some() {
+                1
+            } else {
+                0
+            };
             column_index_declared |= chunk.column_index_offset().is_some();
             offset_index_declared |= chunk.offset_index_offset().is_some();
         }
@@ -147,7 +154,9 @@ fn columns_from_metadata(dataset_id: &str, metadata: &ParquetMetaData) -> Column
             name: descriptor.path().string(),
             leaf_index,
             physical_type: format!("{:?}", descriptor.physical_type()),
-            logical_type: descriptor.logical_type_ref().map(|value| format!("{value:?}")),
+            logical_type: descriptor
+                .logical_type_ref()
+                .map(|value| format!("{value:?}")),
             compressed_bytes: compressed,
             uncompressed_bytes: uncompressed,
             percent_of_compressed_data: percent(compressed, total_compressed),
@@ -199,7 +208,10 @@ fn row_groups(dataset: &OpenedDataset) -> Result<RowGroupsAnalysisResponse> {
                         uncompressed_bytes: nonnegative_i64(chunk.uncompressed_size()),
                         num_values: nonnegative_i64(chunk.num_values()),
                         compression: format!("{:?}", chunk.compression()),
-                        encodings: chunk.encodings().map(|value| format!("{value:?}")).collect(),
+                        encodings: chunk
+                            .encodings()
+                            .map(|value| format!("{value:?}"))
+                            .collect(),
                         statistics_available: chunk.statistics().is_some(),
                         geo_statistics_available: chunk.geo_statistics().is_some(),
                         data_page_offset: chunk.data_page_offset(),
@@ -245,10 +257,10 @@ async fn pages(
     let metadata = builder.metadata();
     let schema = metadata.file_metadata().schema_descr();
 
-    if let Some(row_group) = query.row_group {
-        if row_group >= metadata.num_row_groups() {
-            bail!("row_group {row_group} is out of range");
-        }
+    if let Some(row_group) = query.row_group
+        && row_group >= metadata.num_row_groups()
+    {
+        bail!("row_group {row_group} is out of range");
     }
 
     let selected_leaves = if let Some(column) = query.column.as_ref() {
@@ -262,7 +274,10 @@ async fn pages(
     let mut output = Vec::new();
 
     for (row_group_index, row_group) in metadata.row_groups().iter().enumerate() {
-        if query.row_group.is_some_and(|wanted| wanted != row_group_index) {
+        if query
+            .row_group
+            .is_some_and(|wanted| wanted != row_group_index)
+        {
             continue;
         }
 
@@ -310,7 +325,9 @@ async fn pages(
     }
 
     let io = metrics.snapshot();
-    let page_indexes_available = output.iter().any(|column| column.offset_index_available || column.column_index_available);
+    let page_indexes_available = output
+        .iter()
+        .any(|column| column.offset_index_available || column.column_index_available);
     let mut notes = Vec::new();
     if !page_indexes_available {
         notes.push("No Parquet page index was available for the selected columns. The viewer did not scan data pages to reconstruct one.".to_string());
@@ -334,10 +351,7 @@ async fn pages(
 /// For unfiltered queries, row groups are selected from offset/limit. For
 /// filtered queries, the estimate is intentionally conservative because the
 /// number/location of matches cannot be known from generic footer metadata.
-fn query_cost(
-    dataset: &OpenedDataset,
-    request: QueryCostRequest,
-) -> Result<QueryCostResponse> {
+fn query_cost(dataset: &OpenedDataset, request: QueryCostRequest) -> Result<QueryCostResponse> {
     let dataset_id = dataset.info.dataset_id.as_str();
     if request.limit == 0 {
         bail!("limit must be at least 1");
@@ -386,7 +400,7 @@ fn query_cost(
             percent_of_estimated_read: percent(compressed_bytes, estimated),
         })
         .collect::<Vec<_>>();
-    contributors.sort_by(|a, b| b.compressed_bytes.cmp(&a.compressed_bytes));
+    contributors.sort_by_key(|column| std::cmp::Reverse(column.compressed_bytes));
 
     let mut warnings = vec![
         "Estimate uses compressed column-chunk sizes from Parquet metadata and does not execute the query.".to_string(),
@@ -401,7 +415,11 @@ fn query_cost(
     Ok(QueryCostResponse {
         dataset_id: dataset_id.to_string(),
         analysis_source: "parquet_footer",
-        estimate_kind: if filtered { "statistics_pruned_upper_bound" } else { "row_group_chunk_estimate" },
+        estimate_kind: if filtered {
+            "statistics_pruned_upper_bound"
+        } else {
+            "row_group_chunk_estimate"
+        },
         requested_rows: request.limit,
         requested_columns: projected.len(),
         row_groups,
@@ -413,16 +431,18 @@ fn query_cost(
 }
 
 /// Produce read-only findings aimed at interactive/browser access patterns.
-fn recommendations(
-    dataset: &OpenedDataset,
-) -> Result<AnalysisRecommendationsResponse> {
+fn recommendations(dataset: &OpenedDataset) -> Result<AnalysisRecommendationsResponse> {
     let dataset_id = dataset.info.dataset_id.as_str();
     let info = &dataset.info;
     let metadata = dataset.reader_metadata.metadata().as_ref();
     let columns = columns_from_metadata(dataset_id, metadata);
     let rg_count = metadata.num_row_groups();
     let total_compressed = columns.compressed_data_bytes;
-    let average_rg = if rg_count == 0 { 0 } else { total_compressed / rg_count as u64 };
+    let average_rg = if rg_count == 0 {
+        0
+    } else {
+        total_compressed / rg_count as u64
+    };
     let mut findings = Vec::new();
 
     if average_rg >= LARGE_ROW_GROUP_BYTES {
@@ -443,22 +463,36 @@ fn recommendations(
         });
     }
 
-    let geo_names = info.geo_columns.iter().map(|column| column.name.as_str()).collect::<BTreeSet<_>>();
-    if let Some(geometry) = columns.columns.iter().filter(|column| {
-        geo_names.contains(column.name.as_str()) || geo_names.iter().any(|root| column.name.starts_with(&format!("{root}.")))
-    }).max_by_key(|column| column.compressed_bytes) {
-        if geometry.percent_of_compressed_data >= 50.0 {
-            findings.push(AnalysisFinding {
+    let geo_names = info
+        .geo_columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Some(geometry) = columns
+        .columns
+        .iter()
+        .filter(|column| {
+            geo_names.contains(column.name.as_str())
+                || geo_names
+                    .iter()
+                    .any(|root| column.name.starts_with(&format!("{root}.")))
+        })
+        .max_by_key(|column| column.compressed_bytes)
+        && geometry.percent_of_compressed_data >= 50.0
+    {
+        findings.push(AnalysisFinding {
                 code: "GEOMETRY_DOMINATES_STORAGE",
                 severity: if geometry.percent_of_compressed_data >= 80.0 { "high" } else { "medium" },
                 title: "Geometry dominates compressed storage".to_string(),
                 detail: format!("{} accounts for {:.1}% of compressed column data.", geometry.name, geometry.percent_of_compressed_data),
                 recommendation: Some("Expect geometry-inclusive queries to be much more expensive than scalar-column previews; inspect query-cost and page layout before changing the file elsewhere.".to_string()),
-            });
-        }
+        });
     }
 
-    let declared_page_index = columns.columns.iter().any(|column| column.offset_index_declared || column.column_index_declared);
+    let declared_page_index = columns
+        .columns
+        .iter()
+        .any(|column| column.offset_index_declared || column.column_index_declared);
     if !declared_page_index {
         findings.push(AnalysisFinding {
             code: "NO_PAGE_INDEX",
@@ -469,8 +503,17 @@ fn recommendations(
         });
     }
 
-    let chunks_total = metadata.row_groups().iter().map(|rg| rg.num_columns()).sum::<usize>();
-    let chunks_with_stats = metadata.row_groups().iter().flat_map(|rg| rg.columns()).filter(|column| column.statistics().is_some()).count();
+    let chunks_total = metadata
+        .row_groups()
+        .iter()
+        .map(|rg| rg.num_columns())
+        .sum::<usize>();
+    let chunks_with_stats = metadata
+        .row_groups()
+        .iter()
+        .flat_map(|rg| rg.columns())
+        .filter(|column| column.statistics().is_some())
+        .count();
     if chunks_total > 0 && chunks_with_stats * 100 < chunks_total * 80 {
         findings.push(AnalysisFinding {
             code: "LOW_STATISTICS_COVERAGE",
@@ -498,7 +541,10 @@ fn recommendations(
 }
 
 /// Resolve top-level or nested column selectors to Parquet leaf indices.
-fn resolve_leaf_indices(metadata: &ParquetMetaData, columns: Option<&[String]>) -> Result<Vec<usize>> {
+fn resolve_leaf_indices(
+    metadata: &ParquetMetaData,
+    columns: Option<&[String]>,
+) -> Result<Vec<usize>> {
     let schema = metadata.file_metadata().schema_descr();
     let Some(columns) = columns else {
         return Ok((0..schema.num_columns()).collect());
@@ -513,7 +559,8 @@ fn resolve_leaf_indices(metadata: &ParquetMetaData, columns: Option<&[String]>) 
         for (leaf_index, descriptor) in schema.columns().iter().enumerate() {
             let path = descriptor.path().string();
             let root = path.split('.').next().unwrap_or(path.as_str());
-            if path == *requested || root == requested || path.starts_with(&format!("{requested}.")) {
+            if path == *requested || root == requested || path.starts_with(&format!("{requested}."))
+            {
                 selected.insert(leaf_index);
                 matched = true;
             }
@@ -556,13 +603,20 @@ fn nonnegative_i64(value: i64) -> u64 {
 }
 
 fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
-    if denominator == 0 { None } else { Some(numerator as f64 / denominator as f64) }
+    if denominator == 0 {
+        None
+    } else {
+        Some(numerator as f64 / denominator as f64)
+    }
 }
 
 fn percent(part: u64, total: u64) -> f64 {
-    if total == 0 { 0.0 } else { part as f64 * 100.0 / total as f64 }
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / total as f64
+    }
 }
-
 
 impl CoreEngine {
     pub async fn analysis_summary(&self, dataset_id: &str) -> Result<AnalysisSummaryResponse> {

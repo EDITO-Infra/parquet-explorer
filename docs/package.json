@@ -1,5 +1,5 @@
 {
-  "name": "parquet-viewer-docs",
+  "name": "parquet-explorer-docs",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,5 +9,8 @@
   },
   "devDependencies": {
     "vitepress": "^2.0.0-alpha.19"
+  },
+  "dependencies": {
+    "proj4": "^2.22.0"
   }
 }

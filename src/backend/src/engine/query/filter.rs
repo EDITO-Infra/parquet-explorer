@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use arrow::{
     array::{ArrayRef, BooleanArray, Float64Array, Int64Array, Scalar, StringArray, UInt64Array},
     compute::kernels::{cmp, comparison},
@@ -14,8 +14,8 @@ use arrow::{
     datatypes::DataType,
 };
 use parquet::arrow::{
-    arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowFilter},
     ProjectionMask,
+    arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowFilter},
 };
 use serde_json::Value;
 

@@ -1,4 +1,4 @@
-# Show & tell: how Parquet Viewer works
+# Show & tell: how Parquet Explorer works
 
 A read-only explorer for Parquet/GeoParquet files that live on remote object storage (S3, HTTP). The Rust backend does the data work; the React frontend does the interaction. This page walks through the whole system end to end: backend internals, how the frontend activates them over the API, why querying is fast, and where it can improve.
 
@@ -41,7 +41,7 @@ graph TD
 **`CoreEngine`** (`src/backend/src/engine.rs`) is a thin facade over the feature modules:
 
 - **`source.rs` — the range reader.** Implements Parquet-RS's `AsyncFileReader` over `object_store`, so the same code path handles S3, GCS, Azure, plain HTTP, or local files. Every awaited storage call is counted and timed (`ReadMetrics`: calls, ranges, requested vs returned bytes, IO ms) — this feeds the diagnostics panel. Opening uses a *suffix* range read to fetch the footer without a preliminary whole-object read.
-- **`dataset.rs` + `registry.rs` — the handle store.** Opening caches an `OpenedDataset` (parsed footer + reusable store client) under a UUID `dataset_id` in an in-memory `HashMap`. No row data — just metadata. Idle handles expire (default 1 hour via `PV_DATASET_IDLE_TIMEOUT_SECONDS`), a cleanup task prunes them, and every lookup refreshes the timestamp. Crucially, later requests **reuse the cached footer** — zero metadata I/O per query.
+- **`dataset.rs` + `registry.rs` — the handle store.** Opening caches an `OpenedDataset` (parsed footer + reusable store client) under a UUID `dataset_id` in an in-memory `HashMap`. No row data — just metadata. Idle handles expire (default 1 hour via `PE_DATASET_IDLE_TIMEOUT_SECONDS`), a cleanup task prunes them, and every lookup refreshes the timestamp. Crucially, later requests **reuse the cached footer** — zero metadata I/O per query.
 - **`query/` — execution planning.** Three steps happen before any decode:
   - `pruning.rs` — conservative row-group pruning: if a row group's footer min/max proves the filter cannot match (e.g. `depth > 5000` but the group's max is 200), the group is skipped entirely. Unknown or inexact statistics keep the group; exact evaluation remains authoritative, so pruning never changes results.
   - `filter.rs` — API filter clauses compile into native Parquet-RS `RowFilter` predicates, each with a separate one-column projection. Filtering on `depth` while displaying `id, name` reads the `depth` chunk, discards non-matching rows *during decode*, and never ships those columns to the browser.

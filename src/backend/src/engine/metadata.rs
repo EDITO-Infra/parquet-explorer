@@ -185,46 +185,45 @@ pub(super) fn build_dataset_info(
         let primary = metadata_geo.primary_column.as_str();
         let already_known = geo_columns.iter().any(|column| column.name == primary);
 
-        if !already_known {
-            if let Some(schema_column) = columns.iter().find(|column| column.name == primary) {
-                let binary = matches!(
-                    schema_column.arrow_type.as_str(),
-                    "Binary" | "LargeBinary" | "BinaryView"
-                ) || schema_column.parquet_physical_type.as_deref()
-                    == Some("BYTE_ARRAY");
+        if !already_known
+            && let Some(schema_column) = columns.iter().find(|column| column.name == primary)
+        {
+            let binary = matches!(
+                schema_column.arrow_type.as_str(),
+                "Binary" | "LargeBinary" | "BinaryView"
+            ) || schema_column.parquet_physical_type.as_deref() == Some("BYTE_ARRAY");
 
-                if binary {
-                    let column_metadata = metadata_geo.columns.get(primary);
-                    let metadata_bbox = column_metadata.and_then(|column| column.bbox.clone());
-                    let dataset_bbox = metadata_bbox
-                        .as_deref()
-                        .and_then(metadata_bbox_xy)
-                        .map(Vec::from);
+            if binary {
+                let column_metadata = metadata_geo.columns.get(primary);
+                let metadata_bbox = column_metadata.and_then(|column| column.bbox.clone());
+                let dataset_bbox = metadata_bbox
+                    .as_deref()
+                    .and_then(metadata_bbox_xy)
+                    .map(Vec::from);
 
-                    geo_columns.push(GeoColumnInfo {
-                        name: primary.to_string(),
-                        logical_type: "WKB".to_string(),
-                        crs: column_metadata
-                            .map(|column| column.normalized_crs())
-                            .unwrap_or_else(|| "OGC:CRS84".to_string()),
-                        edge_interpolation: Some(
-                            column_metadata
-                                .and_then(|column| column.edges.clone())
-                                .unwrap_or_else(|| "planar".to_string())
-                                .to_ascii_uppercase(),
-                        ),
-                        is_primary: true,
-                        geometry_types: column_metadata
-                            .map(|column| column.geometry_types.clone())
-                            .unwrap_or_default(),
-                        orientation: column_metadata.and_then(|column| column.orientation.clone()),
-                        epoch: column_metadata.and_then(|column| column.epoch),
-                        metadata_bbox,
-                        row_groups_with_bbox: 0,
-                        row_groups_total: metadata.num_row_groups(),
-                        dataset_bbox,
-                    });
-                }
+                geo_columns.push(GeoColumnInfo {
+                    name: primary.to_string(),
+                    logical_type: "WKB".to_string(),
+                    crs: column_metadata
+                        .map(|column| column.normalized_crs())
+                        .unwrap_or_else(|| "OGC:CRS84".to_string()),
+                    edge_interpolation: Some(
+                        column_metadata
+                            .and_then(|column| column.edges.clone())
+                            .unwrap_or_else(|| "planar".to_string())
+                            .to_ascii_uppercase(),
+                    ),
+                    is_primary: true,
+                    geometry_types: column_metadata
+                        .map(|column| column.geometry_types.clone())
+                        .unwrap_or_default(),
+                    orientation: column_metadata.and_then(|column| column.orientation.clone()),
+                    epoch: column_metadata.and_then(|column| column.epoch),
+                    metadata_bbox,
+                    row_groups_with_bbox: 0,
+                    row_groups_total: metadata.num_row_groups(),
+                    dataset_bbox,
+                });
             }
         }
     }
@@ -393,17 +392,17 @@ fn build_geo_parquet_info(
                 column.encoding
             ));
         }
-        if let Some(orientation) = column.orientation.as_deref() {
-            if orientation != "counterclockwise" {
-                warnings.push(format!(
-                    "geo metadata column '{name}' has invalid orientation '{orientation}'"
-                ));
-            }
+        if let Some(orientation) = column.orientation.as_deref()
+            && orientation != "counterclockwise"
+        {
+            warnings.push(format!(
+                "geo metadata column '{name}' has invalid orientation '{orientation}'"
+            ));
         }
-        if let Some(bbox) = column.bbox.as_deref() {
-            if !matches!(bbox.len(), 4 | 6 | 8) || bbox.iter().any(|value| !value.is_finite()) {
-                warnings.push(format!("geo metadata column '{name}' has an invalid bbox"));
-            }
+        if let Some(bbox) = column.bbox.as_deref()
+            && (!matches!(bbox.len(), 4 | 6 | 8) || bbox.iter().any(|value| !value.is_finite()))
+        {
+            warnings.push(format!("geo metadata column '{name}' has an invalid bbox"));
         }
         if column.epoch.is_some_and(|epoch| !epoch.is_finite()) {
             warnings.push(format!(

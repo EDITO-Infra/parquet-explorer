@@ -103,7 +103,7 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
-    window.localStorage.setItem('parquet-viewer-theme', theme)
+    window.localStorage.setItem('parquet-explorer-theme', theme)
   }, [theme])
 
   // Drop a complete-result cache as soon as the viewer returns to ordinary
@@ -577,7 +577,7 @@ export default function App() {
         <div className="brand-block">
           <div className="brand-mark" aria-hidden="true">P</div>
           <div>
-            <h1>Parquet Viewer</h1>
+            <h1>Parquet Explorer</h1>
             <p>Open, inspect, filter and map Parquet files.</p>
           </div>
         </div>
@@ -735,7 +735,7 @@ function TabButton({
 }
 
 function getInitialTheme(): Theme {
-  const saved = window.localStorage.getItem('parquet-viewer-theme')
+  const saved = window.localStorage.getItem('parquet-explorer-theme')
   if (saved === 'light' || saved === 'dark') return saved
   return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
 }

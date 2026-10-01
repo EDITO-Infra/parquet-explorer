@@ -37,7 +37,12 @@ pub struct TraceReporter {
 
 impl TraceStore {
     /// Start/replace a trace for this request ID. Empty IDs disable tracing.
-    pub fn start(&self, trace_id: Option<&str>, operation: &str, message: &str) -> Option<TraceReporter> {
+    pub fn start(
+        &self,
+        trace_id: Option<&str>,
+        operation: &str,
+        message: &str,
+    ) -> Option<TraceReporter> {
         let trace_id = trace_id?.trim();
         if trace_id.is_empty() {
             return None;
@@ -160,8 +165,6 @@ impl TraceReporter {
         self.store
             .event(&self.trace_id, stage, message, Some(detail.into()), None);
     }
-
-
 
     /// Record work whose duration was measured explicitly at the call site.
     pub fn event_with_duration(

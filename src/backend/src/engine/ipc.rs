@@ -164,21 +164,21 @@ where
             response_queue_ms = response_queue_ms.saturating_add(send.queue_ms);
             ipc_bytes = ipc_bytes.saturating_add(send.bytes);
 
-            if batch_count == 1 {
-                if let Some(trace) = &trace {
-                    trace.event_with_duration(
-                        "arrow_ipc_encode_first",
-                        "Encoding first batch as Arrow IPC",
-                        encode_ms,
-                        format!("{} encoded", format_bytes(send.bytes)),
-                    );
-                    trace.event_with_duration(
-                        "response_queue_first",
-                        "Queueing first batch for the HTTP response",
-                        send.queue_ms,
-                        "Server-side queue/backpressure time; this is not network transfer time",
-                    );
-                }
+            if batch_count == 1
+                && let Some(trace) = &trace
+            {
+                trace.event_with_duration(
+                    "arrow_ipc_encode_first",
+                    "Encoding first batch as Arrow IPC",
+                    encode_ms,
+                    format!("{} encoded", format_bytes(send.bytes)),
+                );
+                trace.event_with_duration(
+                    "response_queue_first",
+                    "Queueing first batch for the HTTP response",
+                    send.queue_ms,
+                    "Server-side queue/backpressure time; this is not network transfer time",
+                );
             }
         }
 

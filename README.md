@@ -1,4 +1,4 @@
-# Parquet Viewer
+# Parquet Explorer
 
 A read-only Parquet/GeoParquet explorer with a Rust backend and React/MapLibre frontend.
 
@@ -21,7 +21,7 @@ The viewer does not download or manage source files as application state. It ope
 
 ## Authorship and funding
 
-Parquet Viewer is developed at the (**Flanders Marine Institute (VLIZ)**)(https://www.vliz.be/) as a part of the (**European Digital Twin Ocean (EDTO)**)[https://www.edito.eu/], a Horizon Europe project supporting the continued development of the European Digital Twin Ocean.
+Parquet Explorer is developed at the [Flanders Marine Institute (VLIZ)](https://www.vliz.be/) as a part of the [European Digital Twin Ocean (EDITO)](https://www.edito.eu/), a Horizon Europe project supporting the continued development of the European Digital Twin Ocean.
 
 This work is funded by the European Union under **grant agreement No. 101227771**.
 
@@ -89,7 +89,7 @@ curl -X POST http://localhost:8080/api/v1/datasets/open \
 
 The ID is a temporary process-local handle, not an identifier stored in the Parquet file. The frontend keeps the returned `DatasetInfo` in memory and uses `dataset.dataset_id` for later requests.
 
-Handles expire after an idle timeout (`PV_DATASET_IDLE_TIMEOUT_SECONDS`, default `3600`; `0` disables expiry). Opening another URL best-effort closes the previous handle, while backend expiry cleans up abandoned sessions.
+Handles expire after an idle timeout (`PE_DATASET_IDLE_TIMEOUT_SECONDS`, default `3600`; `0` disables expiry). Opening another URL best-effort closes the previous handle, while backend expiry cleans up abandoned sessions.
 
 ## Diagnostics
 
@@ -103,7 +103,7 @@ Prerequisites:
 
 - Rust and Cargo **1.88+** — the latest stable Rust is recommended.
 - Node.js **20.19+ or 22.12+** with npm — the latest LTS release is recommended.
-- Optional: Docker with Compose support.
+- Optional: Docker.
 
 From the repository root:
 
@@ -124,11 +124,13 @@ npm run dev --prefix src/frontend
 
 Open `http://localhost:5173`
 
-Docker Compose
+Docker
 
+Build the image (same Dockerfile as CI) and run it:
 
 ```bash
-docker compose up --build
+docker build -f deploy/Dockerfile -t parquet-explorer .
+docker run --rm -p 3000:80 parquet-explorer
 ```
 go to `http://localhost:3000`
 
@@ -149,7 +151,7 @@ make build-frontend
 src/backend/       Rust API + Parquet/Arrow engine
 src/frontend/     React + Arrow JS + MapLibre frontend
 docs/             developer documentation
-deploy/           reverse-proxy configuration
+deploy/           Docker image (Dockerfile, nginx config, start script)
 ```
 
 ## Security
@@ -161,7 +163,7 @@ A server that fetches user-provided URLs is an SSRF boundary. The application va
 A public dataset useful for local development and performance testing:
 
 ```text
-https://s3.waw3-1.cloudferro.com/emodnet/emodnet_biology/12639/marine_biodiversity_observations_occurrence_2026-08-19.parquet
+https://s3.waw3-1.cloudferro.com/emodnet/emodnet_biology/12639/marine_biodiversity_observations_occurrence_2026-09-30.parquet
 ```
 
 `IMISDatasetId: 9064`

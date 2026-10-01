@@ -25,16 +25,16 @@ where
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response.headers_mut().insert(
-        http::HeaderName::from_static("x-parquet-viewer-format"),
+        http::HeaderName::from_static("x-parquet-explorer-format"),
         HeaderValue::from_static("arrow-ipc-stream"),
     );
-    if let Some((name, value)) = extra_header {
-        if let (Ok(name), Ok(value)) = (
+    if let Some((name, value)) = extra_header
+        && let (Ok(name), Ok(value)) = (
             name.parse::<http::HeaderName>(),
             value.parse::<HeaderValue>(),
-        ) {
-            response.headers_mut().insert(name, value);
-        }
+        )
+    {
+        response.headers_mut().insert(name, value);
     }
     response
 }

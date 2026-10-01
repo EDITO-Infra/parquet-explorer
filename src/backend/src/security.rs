@@ -4,7 +4,10 @@
 //! credentials, DNS results, and local-file policy is part of the security
 //! boundary before any object-store reader is created.
 
-use std::{net::{IpAddr, Ipv4Addr, Ipv6Addr}, path::Path};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 use tokio::net::lookup_host;
@@ -29,14 +32,28 @@ pub async fn validate_source_uri(input: &str, settings: &Settings) -> Result<Str
     match scheme.as_str() {
         "http" | "https" => validate_remote(&url, settings).await?,
         "file" => {
-            if !settings.allow_local_files { bail!("local file sources are disabled"); }
-            let path = url.to_file_path().map_err(|_| anyhow::anyhow!("invalid file URL"))?;
-            let canonical = tokio::fs::canonicalize(&path).await
+            if !settings.allow_local_files {
+                bail!("local file sources are disabled");
+            }
+            let path = url
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URL"))?;
+            let canonical = tokio::fs::canonicalize(&path)
+                .await
                 .with_context(|| format!("could not resolve local path {}", path.display()))?;
-            let root = tokio::fs::canonicalize(&settings.local_data_root).await
-                .with_context(|| format!("could not resolve PV_LOCAL_DATA_ROOT {}", settings.local_data_root.display()))?;
-            if !is_within(&canonical, &root) { bail!("local file is outside PV_LOCAL_DATA_ROOT"); }
-            url = Url::from_file_path(canonical).map_err(|_| anyhow::anyhow!("could not normalize file URL"))?;
+            let root = tokio::fs::canonicalize(&settings.local_data_root)
+                .await
+                .with_context(|| {
+                    format!(
+                        "could not resolve PE_LOCAL_DATA_ROOT {}",
+                        settings.local_data_root.display()
+                    )
+                })?;
+            if !is_within(&canonical, &root) {
+                bail!("local file is outside PE_LOCAL_DATA_ROOT");
+            }
+            url = Url::from_file_path(canonical)
+                .map_err(|_| anyhow::anyhow!("could not normalize file URL"))?;
         }
         _ => {}
     }
@@ -45,19 +62,31 @@ pub async fn validate_source_uri(input: &str, settings: &Settings) -> Result<Str
 
 async fn validate_remote(url: &Url, settings: &Settings) -> Result<()> {
     let host = url.host_str().context("remote URL has no host")?;
-    if !settings.allowed_remote_hosts.is_empty() && !host_allowed(host, &settings.allowed_remote_hosts) {
+    if !settings.allowed_remote_hosts.is_empty()
+        && !host_allowed(host, &settings.allowed_remote_hosts)
+    {
         bail!("remote host '{host}' is not allowlisted");
     }
-    if settings.allow_private_networks { return Ok(()); }
+    if settings.allow_private_networks {
+        return Ok(());
+    }
 
-    let port = url.port_or_known_default().context("URL scheme has no known port")?;
-    let addresses = lookup_host((host, port)).await.with_context(|| format!("could not resolve '{host}'"))?;
+    let port = url
+        .port_or_known_default()
+        .context("URL scheme has no known port")?;
+    let addresses = lookup_host((host, port))
+        .await
+        .with_context(|| format!("could not resolve '{host}'"))?;
     let mut found = false;
     for address in addresses {
         found = true;
-        if is_special_ip(address.ip()) { bail!("remote host resolves to a private or special-use address"); }
+        if is_special_ip(address.ip()) {
+            bail!("remote host resolves to a private or special-use address");
+        }
     }
-    if !found { bail!("remote host did not resolve to any address"); }
+    if !found {
+        bail!("remote host did not resolve to any address");
+    }
     Ok(())
 }
 
@@ -67,11 +96,15 @@ fn host_allowed(host: &str, patterns: &[String]) -> bool {
         let pattern = pattern.to_ascii_lowercase();
         if let Some(suffix) = pattern.strip_prefix("*.") {
             host.ends_with(&format!(".{suffix}")) && host != suffix
-        } else { host == pattern }
+        } else {
+            host == pattern
+        }
     })
 }
 
-fn is_within(path: &Path, root: &Path) -> bool { path == root || path.starts_with(root) }
+fn is_within(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
 
 fn is_special_ip(ip: IpAddr) -> bool {
     match ip {
@@ -81,8 +114,13 @@ fn is_special_ip(ip: IpAddr) -> bool {
 }
 
 fn special_v4(ip: Ipv4Addr) -> bool {
-    ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_broadcast() || ip.is_documentation()
-        || ip.is_multicast() || ip.is_unspecified()
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || ip.is_unspecified()
         || ip.octets()[0] == 0
         || ip.octets()[0] >= 224
         || matches!(ip.octets(), [100, 64..=127, _, _])

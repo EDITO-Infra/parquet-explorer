@@ -34,7 +34,6 @@ pub struct DatasetInfo {
     pub capabilities: Capabilities,
 }
 
-
 /// Compact physical-layout information derived once from the Parquet footer.
 ///
 /// Detailed row-group/page metadata stays server-side or behind the analysis
@@ -212,17 +211,12 @@ pub struct SpatialRequest {
     pub filters: Vec<FilterClause>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportFormat {
     Arrow,
+    #[default]
     Parquet,
-}
-
-impl Default for ExportFormat {
-    fn default() -> Self {
-        Self::Parquet
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

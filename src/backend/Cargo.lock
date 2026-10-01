@@ -1496,20 +1496,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "parquet-geospatial"
-version = "59.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e3383d7e5a8e846863f12dc78a292e62510fd216a70023f5c327f1d833bf690"
-dependencies = [
- "arrow-schema",
- "geo-traits",
- "serde",
- "serde_json",
- "wkb",
-]
-
-[[package]]
-name = "parquet-viewer-backend"
+name = "parquet-explorer-backend"
 version = "0.3.0"
 dependencies = [
  "anyhow",
@@ -1536,6 +1523,19 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "parquet-geospatial"
+version = "59.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e3383d7e5a8e846863f12dc78a292e62510fd216a70023f5c327f1d833bf690"
+dependencies = [
+ "arrow-schema",
+ "geo-traits",
+ "serde",
+ "serde_json",
+ "wkb",
 ]
 
 [[package]]

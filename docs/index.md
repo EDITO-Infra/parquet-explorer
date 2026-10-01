@@ -1,4 +1,4 @@
-# Parquet Viewer developer documentation
+# Parquet Explorer developer documentation
 
 This documentation explains the parts of the project that should remain useful even as implementation details change. The source code and API models are the authority for exact fields and function signatures.
 

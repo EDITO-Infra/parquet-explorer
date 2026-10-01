@@ -1,8 +1,8 @@
 import { defineConfig } from "vitepress"
 
 export default defineConfig({
-  title: "Parquet Viewer",
-  description: "Architecture and developer documentation for Parquet Viewer",
+  title: "Parquet Explorer",
+  description: "Architecture and developer documentation for Parquet Explorer",
 
   cleanUrls: true,
 

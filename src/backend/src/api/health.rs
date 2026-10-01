@@ -11,6 +11,6 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        native_engine: format!("parquet-viewer-backend/{}", env!("CARGO_PKG_VERSION")),
+        native_engine: format!("parquet-explorer-backend/{}", env!("CARGO_PKG_VERSION")),
     })
 }

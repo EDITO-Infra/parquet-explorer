@@ -1,10 +1,10 @@
 [package]
-name = "parquet-viewer-backend"
+name = "parquet-explorer-backend"
 version = "0.3.0"
 rust-version = "1.88"
 edition = "2024"
 license = "MIT"
-description = "Native Rust Arrow/GeoParquet backend for Parquet Viewer"
+description = "Native Rust Arrow/GeoParquet backend for Parquet Explorer"
 
 [dependencies]
 arrow = "59.2.0"

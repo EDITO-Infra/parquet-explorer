@@ -18,7 +18,7 @@ A healthy backend returns JSON similar to:
 ```json
 {
   "status": "ok",
-  "native_engine": "parquet-viewer-backend/0.3.0"
+  "native_engine": "parquet-explorer-backend/0.3.0"
 }
 ```
 
@@ -86,7 +86,7 @@ curl --fail --request POST \
   --output page.arrow
 ```
 
-The page limit must be between 1 and 500,000 rows (and may be lower if the backend is configured with a smaller `PV_MAX_PAGE_SIZE`). Global sorting is reserved by the request contract but is not currently implemented.
+The page limit must be between 1 and 500,000 rows (and may be lower if the backend is configured with a smaller `PE_MAX_PAGE_SIZE`). Global sorting is reserved by the request contract but is not currently implemented.
 
 ### Read the Arrow response in Python
 
@@ -186,7 +186,7 @@ curl --fail --request POST \
   --output spatial.arrow
 ```
 
-This endpoint currently performs conservative row-group bounding-box pruning, not exact feature-level intersection. The response header `x-parquet-viewer-spatial-filter: row-group-bbox-candidates` makes that behavior explicit; clients must perform exact geometry filtering if they require it.
+This endpoint currently performs conservative row-group bounding-box pruning, not exact feature-level intersection. The response header `x-parquet-explorer-spatial-filter: row-group-bbox-candidates` makes that behavior explicit; clients must perform exact geometry filtering if they require it.
 
 ## Export a subset
 

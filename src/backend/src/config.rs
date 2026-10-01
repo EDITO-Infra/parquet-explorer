@@ -32,38 +32,38 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Parse and validate supported `PV_*` environment variables.
+    /// Parse and validate supported `PE_*` environment variables.
     pub fn from_env() -> Result<Self> {
-        let host = env::var("PV_HOST").unwrap_or_else(|_| "0.0.0.0".into());
-        let port = env::var("PV_PORT")
+        let host = env::var("PE_HOST").unwrap_or_else(|_| "0.0.0.0".into());
+        let port = env::var("PE_PORT")
             .unwrap_or_else(|_| "8080".into())
             .parse::<u16>()
-            .context("PV_PORT must be a valid TCP port")?;
+            .context("PE_PORT must be a valid TCP port")?;
         let ip = host
             .parse::<IpAddr>()
-            .context("PV_HOST must be an IP address")?;
+            .context("PE_HOST must be an IP address")?;
 
         Ok(Self {
             bind: SocketAddr::new(ip, port),
             cors_origins: csv(
-                "PV_CORS_ORIGINS",
+                "PE_CORS_ORIGINS",
                 "http://localhost:5173,http://localhost:3000",
             ),
-            allowed_source_schemes: csv("PV_ALLOWED_SOURCE_SCHEMES", "https,http")
+            allowed_source_schemes: csv("PE_ALLOWED_SOURCE_SCHEMES", "https,http")
                 .into_iter()
                 .map(|s| s.to_ascii_lowercase())
                 .collect(),
-            allowed_remote_hosts: csv("PV_ALLOWED_REMOTE_HOSTS", ""),
-            allow_private_networks: boolean("PV_ALLOW_PRIVATE_NETWORKS", false),
-            allow_local_files: boolean("PV_ALLOW_LOCAL_FILES", false),
+            allowed_remote_hosts: csv("PE_ALLOWED_REMOTE_HOSTS", ""),
+            allow_private_networks: boolean("PE_ALLOW_PRIVATE_NETWORKS", false),
+            allow_local_files: boolean("PE_ALLOW_LOCAL_FILES", false),
             local_data_root: PathBuf::from(
-                env::var("PV_LOCAL_DATA_ROOT").unwrap_or_else(|_| "/data".into()),
+                env::var("PE_LOCAL_DATA_ROOT").unwrap_or_else(|_| "/data".into()),
             ),
-            max_page_size: number("PV_MAX_PAGE_SIZE", 500_000)?,
-            max_spatial_features: number("PV_MAX_SPATIAL_FEATURES", 100_000)?,
-            batch_size: number("PV_BATCH_SIZE", 8_192)?,
-            max_open_datasets: number("PV_MAX_OPEN_DATASETS", 512)?,
-            dataset_idle_timeout_seconds: number("PV_DATASET_IDLE_TIMEOUT_SECONDS", 3_600_u64)?,
+            max_page_size: number("PE_MAX_PAGE_SIZE", 500_000)?,
+            max_spatial_features: number("PE_MAX_SPATIAL_FEATURES", 100_000)?,
+            batch_size: number("PE_BATCH_SIZE", 8_192)?,
+            max_open_datasets: number("PE_MAX_OPEN_DATASETS", 512)?,
+            dataset_idle_timeout_seconds: number("PE_DATASET_IDLE_TIMEOUT_SECONDS", 3_600_u64)?,
         })
     }
 }

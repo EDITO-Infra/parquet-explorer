@@ -225,10 +225,7 @@ impl DatasetSource {
         metadata: &ArrowReaderMetadata,
         metrics: ReadMetrics,
     ) -> ReaderBuilder {
-        ParquetRecordBatchStreamBuilder::new_with_metadata(
-            self.reader(metrics),
-            metadata.clone(),
-        )
+        ParquetRecordBatchStreamBuilder::new_with_metadata(self.reader(metrics), metadata.clone())
     }
 
     pub(super) async fn builder_with_options(

@@ -107,12 +107,11 @@ fn choose_geometry_column(info: &DatasetInfo, requested: Option<&str>) -> Result
         bail!("not a recognized geospatial column: {requested}");
     }
 
-    if let Some(primary) = metadata_primary {
-        if info.geo_columns.iter().any(|column| column.name == primary)
-            || info.columns.iter().any(|column| column.name == primary)
-        {
-            return Ok(primary.to_string());
-        }
+    if let Some(primary) = metadata_primary
+        && (info.geo_columns.iter().any(|column| column.name == primary)
+            || info.columns.iter().any(|column| column.name == primary))
+    {
+        return Ok(primary.to_string());
     }
 
     info.geo_columns

@@ -4,7 +4,7 @@
 
 - Rust and Cargo **1.88+** — use the latest stable Rust when possible.
 - Node.js **20.19+ or 22.12+** with npm — use the latest LTS release when possible.
-- Optional: Docker with Compose support.
+- Optional: Docker.
 
 ## Install
 
@@ -34,5 +34,8 @@ npm run dev --prefix src/frontend
 Open `http://localhost:5173`, or run the containerized application:
 
 ```bash
-docker compose up --build
+docker build -f deploy/Dockerfile -t parquet-explorer .
+docker run --rm -p 8080:80 parquet-explorer
 ```
+
+The container serves the frontend and API on port 8080.

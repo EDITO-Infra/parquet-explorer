@@ -30,10 +30,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
             "/datasets/{dataset_id}/analysis/row-groups",
             get(analysis_row_groups),
         )
-        .route(
-            "/datasets/{dataset_id}/analysis/pages",
-            get(analysis_pages),
-        )
+        .route("/datasets/{dataset_id}/analysis/pages", get(analysis_pages))
         .route(
             "/datasets/{dataset_id}/analysis/query-cost",
             post(analysis_query_cost),
